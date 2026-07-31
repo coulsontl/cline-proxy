@@ -657,6 +657,7 @@ async function loadConfig() {
 }
 
 // ========== 初始化 ==========
+if (_('footerApiAddr')) _('footerApiAddr').innerText = window.location.origin;
 loadStats();
 loadAccounts();
 loadKeys();

@@ -40,7 +40,7 @@ type chatRequest struct {
 	Extra       map[string]any `json:"-"`
 }
 
-func startProxy(port int) error {
+func startProxy(host string, port int) error {
 	p := loadPool()
 	activeCount := 0
 	for _, a := range p.Accounts {
@@ -220,7 +220,10 @@ func startProxy(port int) error {
 	mux.HandleFunc("/v1/messages", anthropicHandler)
 	mux.HandleFunc("/messages", anthropicHandler)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -230,8 +233,8 @@ func startProxy(port int) error {
 	fmt.Println(strings.Repeat("=", 58))
 	fmt.Println("  Cline Go Proxy v1.0 - No CLI Required")
 	fmt.Println(strings.Repeat("=", 58))
-	fmt.Printf("  http://%s\n", addr)
-	fmt.Printf("  http://%s/v1\n", addr)
+	fmt.Printf("  Listen: http://%s\n", addr)
+	fmt.Printf("  API:    http://%s/v1\n", addr)
 	fmt.Println("  API Key: any value")
 	fmt.Printf("  Model:   %s\n", defaultModel)
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)

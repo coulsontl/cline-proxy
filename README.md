@@ -21,8 +21,8 @@ Cline API 的反向代理服务，支持多账号轮询、OpenAI 和 Anthropic M
 go build -o cline-proxy.exe .
 ./cline-proxy.exe
 
-# 指定端口
-./cline-proxy.exe -port 3457
+# 指定端口与监听地址（默认 -host 0.0.0.0 允许局域网访问，也可设为 -host 127.0.0.1 仅限本地）
+./cline-proxy.exe -host 0.0.0.0 -port 3457
 
 # 构建 + 启动 + 打开浏览器
 go run . -start

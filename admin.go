@@ -630,8 +630,12 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 // GET /admin/api/config
 func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := getProxyConfig()
+	addr := r.Host
+	if addr == "" {
+		addr = "0.0.0.0:3457"
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"address":      "127.0.0.1:3457",
+		"address":      addr,
 		"strategy":     cfg.Strategy,
 		"version":      "go-1.1",
 		"poolPath":     poolPath,

@@ -13,6 +13,7 @@ import (
 func main() {
 	loginMode := flag.Bool("login", false, "Run OAuth device login flow and add account to pool")
 	captureMode := flag.Bool("capture", false, "Run interactive OAuth capture (records ALL traffic)")
+	host := flag.String("host", "0.0.0.0", "Proxy server host (e.g. 0.0.0.0 or 127.0.0.1)")
 	port := flag.Int("port", 3457, "Proxy server port")
 	addAccount := flag.Bool("add-account", false, "Add a new account via OAuth to the pool")
 	showList := flag.Bool("list", false, "List all accounts in the pool")
@@ -20,7 +21,7 @@ func main() {
 	flag.Parse()
 
 	if *startMode {
-		buildAndStart(*port)
+		buildAndStart(*host, *port)
 		return
 	}
 
@@ -59,13 +60,13 @@ func main() {
 		return
 	}
 
-	if err := startProxy(*port); err != nil {
+	if err := startProxy(*host, *port); err != nil {
 		log.Fatalf("Proxy failed: %v", err)
 		os.Exit(1)
 	}
 }
 
-func buildAndStart(port int) {
+func buildAndStart(host string, port int) {
 	exe := "cline-proxy.exe"
 	if runtime.GOOS != "windows" {
 		exe = "./cline-proxy"
