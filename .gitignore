@@ -3,3 +3,5 @@ cline-proxy
 .cline-accounts.json
 data/
 *.exe
+cline-proxy.err
+cline-proxy.log

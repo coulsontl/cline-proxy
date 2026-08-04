@@ -57,6 +57,9 @@ func startProxy(host string, port int) error {
 	}
 	log.Printf("Loaded %d active accounts from pool", activeCount)
 
+	// 后台定期拉取上游 free 模型列表并校验请求模型。
+	initFreeModels()
+
 	freePort(port)
 
 	mux := http.NewServeMux()
@@ -117,15 +120,13 @@ func startProxy(host string, port int) error {
 		})
 	}
 
-	modelsList := []map[string]any{
-		{"id": "cline-free/glm-5.2", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/glm-5.2", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/deepseek-v4-flash", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-		{"id": "cline-pass/qwen3.7-max", "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"},
-	}
-
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": modelsList})
+		ids := listFreeModels()
+		data := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			data = append(data, map[string]any{"id": id, "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/models", modelsHandler)
@@ -136,6 +137,9 @@ func startProxy(host string, port int) error {
 			return
 		}
 		if activeCount == 0 && len(loadPool().Accounts) == 0 {
+			insertRequestRecord(&requestContext{
+				apiFormat: "openai", accountEmail: "no_account", startAt: time.Now(),
+			}, tokenUsage{}, false, 401, "no accounts in pool")
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"error": map[string]string{
 					"message": "No accounts in pool. Run with --add-account or POST /admin/login to add accounts.",
@@ -171,6 +175,21 @@ func startProxy(host string, port int) error {
 		model, _ := params["model"].(string)
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
 
+		// 校验请求模型是否在上游 free 列表（缓存就绪才拦截）
+		if freeModelsReady() && !modelIsFree(model) {
+			insertRequestRecord(&requestContext{
+				apiFormat: "openai", accountEmail: "no_account",
+				model: model, isStream: isStream, startAt: time.Now(),
+			}, tokenUsage{}, false, 403, "model not in free list: "+model)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": map[string]string{
+					"message": "model '" + model + "' is not available in free list",
+					"type":    "model_not_allowed",
+				},
+			})
+			return
+		}
+
 		// Override system prompt from override.md for OpenAI format
 		if override := loadOverrideContent(); override != "" {
 			if msgs, ok := params["messages"].([]any); ok {
@@ -190,9 +209,27 @@ func startProxy(host string, port int) error {
 			}
 		}
 
-		resp, err := callClineAPI(params, isStream)
+		// 输入 token 上限校验：超限直接拒绝，不请求上游
+		if limit := getModelLimit(model); limit > 0 {
+			inputTokens := countRequestTokens(params)
+			if inputTokens > limit {
+				msg := fmt.Sprintf("input tokens %d exceeds model %s context limit %d", inputTokens, model, limit)
+				insertRequestRecord(&requestContext{
+					apiFormat: "openai", accountEmail: "no_account",
+					model: model, isStream: isStream, startAt: time.Now(),
+				}, tokenUsage{promptTokens: inputTokens}, false, 413, msg)
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+					"error": map[string]string{"message": msg, "type": "context_limit_exceeded"},
+				})
+				return
+			}
+		}
+
+		resp, ctx, err := callClineAPI(params, isStream)
+		ctx.apiFormat = "openai"
 		if err != nil {
 			log.Printf("  api error: %v", err)
+			insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
@@ -201,9 +238,9 @@ func startProxy(host string, port int) error {
 		defer resp.Body.Close()
 
 		if isStream {
-			handleStreamResponse(w, resp)
+			handleStreamResponse(w, resp, ctx)
 		} else {
-			handleNonStreamResponse(w, resp)
+			handleNonStreamResponse(w, resp, ctx)
 		}
 	})
 	mux.HandleFunc("/v1/chat/completions", chatHandler)
@@ -340,16 +377,25 @@ func clineHeaders(token, sessionID string) http.Header {
 	return h
 }
 
-func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
+func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestContext, error) {
+	model, _ := params["model"].(string)
+	ctx := &requestContext{
+		model:    model,
+		isStream: stream,
+		startAt:  time.Now(),
+	}
+
 	acc := pickAccount()
 	if acc == nil {
-		return nil, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
+		ctx.accountEmail = "no_account"
+		return nil, ctx, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
 	}
+	ctx.accountEmail = acc.Email
 
 	token, err := ensureAccountToken(acc)
 	if err != nil {
-		// Try other accounts
-		return nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
+		// refreshAccountToken 内部已置 status=expired
+		return nil, ctx, fmt.Errorf("account %s token failed: %w", acc.Email, err)
 	}
 
 	body := buildUpstreamBody(params, stream)
@@ -357,12 +403,12 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal body: %w", err)
+		return nil, ctx, fmt.Errorf("marshal body: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, ctx, fmt.Errorf("create request: %w", err)
 	}
 	req.Header = clineHeaders(token, sessionID)
 
@@ -377,9 +423,8 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		acc.Status = "cooldown"
-		savePool()
-		return nil, fmt.Errorf("upstream request: %w", err)
+		// 网络错误：按确认不触发退避，保持账号可重试。
+		return nil, ctx, fmt.Errorf("upstream request: %w", err)
 	}
 
 	if resp.StatusCode == 401 {
@@ -390,36 +435,33 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, error) {
 			req.Header = clineHeaders(token, sessionID)
 			resp, err = httpClient.Do(req)
 			if err != nil {
-				return nil, fmt.Errorf("upstream retry: %w", err)
+				return nil, ctx, fmt.Errorf("upstream retry: %w", err)
 			}
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
-				acc.Status = "expired"
-				savePool()
-				return nil, fmt.Errorf("account %s token expired permanently", acc.Email)
+				ctx.statusCode = 401
+				return nil, ctx, fmt.Errorf("account %s token expired permanently", acc.Email)
 			}
 		} else {
-			acc.Status = "expired"
-			savePool()
-			return nil, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
+			ctx.statusCode = 401
+			return nil, ctx, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
 	}
 
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// Mark account on cooldown on rate limits
+		ctx.statusCode = resp.StatusCode
+		// 429 限流触发指数退避冷却
 		if resp.StatusCode == 429 {
-			acc.Status = "cooldown"
-			savePool()
+			markCooldown(acc)
 		}
-		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, truncate(string(bodyBytes), 500))
+		return nil, ctx, fmt.Errorf("API %d: %s", resp.StatusCode, truncate(string(bodyBytes), 500))
 	}
 
-	acc.LastUsed = time.Now()
-	acc.UsageCount++
-	savePool()
-	return resp, nil
+	ctx.statusCode = 200
+	markSuccess(acc)
+	return resp, ctx, nil
 }
 
 func truncateEmail(email string) string {
@@ -452,7 +494,7 @@ func getMsgCount(params map[string]any) int {
 	return 0
 }
 
-func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
+func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -462,9 +504,11 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("  streaming not supported for client")
+		insertRequestRecord(ctx, tokenUsage{}, false, 0, "streaming not supported")
 		return
 	}
 
+	var u tokenUsage
 	reader := bufio.NewReader(upstream.Body)
 	for {
 		line, err := reader.ReadString('\n')
@@ -490,7 +534,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
-				// Some Cline responses wrap in {data: {...}} 
+				// Some Cline responses wrap in {data: {...}}
 				if data, ok := obj["data"]; ok {
 					if d, ok := data.(map[string]any); ok {
 						if _, hasChoices := d["choices"]; hasChoices {
@@ -502,6 +546,10 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 					}
 				}
 				normalized := normalizeOpenAIResponse(obj)
+				// 旁路提取 usage（不改 normalized，不改转发顺序）
+				if usage, ok := normalized["usage"].(map[string]any); ok {
+					extractOpenAIUsage(usage, &u)
+				}
 				if normBytes, err := json.Marshal(normalized); err == nil {
 					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
 					flusher.Flush()
@@ -513,11 +561,13 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 		w.Write([]byte(line + "\n"))
 		flusher.Flush()
 	}
+	insertRequestRecord(ctx, u, true, 200, "")
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response) {
+func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
 	var raw map[string]any
 	if err := json.NewDecoder(upstream.Body).Decode(&raw); err != nil {
+		insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
@@ -534,6 +584,11 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 
 	out = normalizeOpenAIResponse(out)
 
+	var u tokenUsage
+	if usage, ok := out["usage"].(map[string]any); ok {
+		extractOpenAIUsage(usage, &u)
+	}
+
 	if msg, ok := getNested(out, "choices", 0, "message").(map[string]any); ok {
 		tc, _ := msg["tool_calls"].([]any)
 		content, _ := msg["content"].(string)
@@ -543,6 +598,7 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response) {
 	}
 
 	writeJSON(w, http.StatusOK, out)
+	insertRequestRecord(ctx, u, true, 200, "")
 }
 
 // Anthropic Messages API support
@@ -576,18 +632,11 @@ type anthropicReq struct {
 }
 
 func loadOverrideContent() string {
-	data, err := os.ReadFile("override.md")
+	data, err := os.ReadFile(overridePath)
 	if err != nil {
-		log.Printf("  override.md not found: %v", err)
 		return ""
 	}
-	content := strings.TrimSpace(string(data))
-	if content != "" {
-		log.Printf("  using override.md as system prompt (%d bytes)", len(content))
-	} else {
-		log.Printf("  override.md is empty")
-	}
-	return content
+	return strings.TrimSpace(string(data))
 }
 
 func extractStringContent(raw json.RawMessage) string {
@@ -860,6 +909,37 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
+	// 校验请求模型是否在上游 free 列表（缓存就绪才拦截）
+	if freeModelsReady() && !modelIsFree(req.Model) {
+		insertRequestRecord(&requestContext{
+			apiFormat: "anthropic", accountEmail: "no_account",
+			model: req.Model, isStream: req.Stream, startAt: time.Now(),
+		}, tokenUsage{}, false, 403, "model not in free list: "+req.Model)
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error": map[string]string{
+				"message": "model '" + req.Model + "' is not available in free list",
+				"type":    "model_not_allowed",
+			},
+		})
+		return
+	}
+
+	// 输入 token 上限校验：超限直接拒绝，不请求上游
+	if limit := getModelLimit(req.Model); limit > 0 {
+		inputTokens := countRequestTokens(openAIReq)
+		if inputTokens > limit {
+			msg := fmt.Sprintf("input tokens %d exceeds model %s context limit %d", inputTokens, req.Model, limit)
+			insertRequestRecord(&requestContext{
+				apiFormat: "anthropic", accountEmail: "no_account",
+				model: req.Model, isStream: req.Stream, startAt: time.Now(),
+			}, tokenUsage{promptTokens: inputTokens}, false, 413, msg)
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": map[string]string{"message": msg, "type": "context_limit_exceeded"},
+			})
+			return
+		}
+	}
+
 	activeCount := 0
 	p := loadPool()
 	for _, a := range p.Accounts {
@@ -869,6 +949,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if activeCount == 0 && len(p.Accounts) == 0 {
+		insertRequestRecord(&requestContext{
+			apiFormat: "anthropic", accountEmail: "no_account",
+			model: req.Model, isStream: req.Stream, startAt: time.Now(),
+		}, tokenUsage{}, false, 401, "no accounts in pool")
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error": map[string]string{
 				"message": "No accounts in pool",
@@ -878,9 +962,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := callClineAPI(openAIReq, req.Stream)
+	resp, ctx, err := callClineAPI(openAIReq, req.Stream)
+	ctx.apiFormat = "anthropic"
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
+		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, truncate(err.Error(), 2000))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
@@ -889,10 +975,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if req.Stream {
-		handleAnthropicStream(w, resp)
+		handleAnthropicStream(w, resp, ctx)
 	} else {
 		var raw map[string]any
 		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
@@ -905,6 +992,12 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		out = normalizeOpenAIResponse(out)
+
+		var u tokenUsage
+		if usage, ok := out["usage"].(map[string]any); ok {
+			extractOpenAIUsage(usage, &u)
+		}
+
 		anthropicResp := openAIToAnthropic(out)
 
 		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
@@ -913,10 +1006,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, http.StatusOK, anthropicResp)
+		insertRequestRecord(ctx, u, true, 200, "")
 	}
 }
 
-func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response) {
+func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
 	log.Printf("  anthropic stream: starting real-time forward")
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -925,8 +1019,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response) {
 	w.WriteHeader(http.StatusOK)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		insertRequestRecord(ctx, tokenUsage{}, false, 0, "streaming not supported")
 		return
 	}
+
+	var u tokenUsage
 
 	emit := func(event string, data any) {
 		d, _ := json.Marshal(data)
@@ -1009,6 +1106,12 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response) {
 			log.Printf("  upstream SSE error: %s", string(errBody))
 			emit("error", map[string]any{"type": "error", "error": errPayload})
 			break
+		}
+
+		// 旁路提取上游 OpenAI 格式 usage（必须在 choices 空检查之前，
+		// 因为 usage-only chunk 的 choices 常为空数组会被跳过）。
+		if usage, ok := obj["usage"].(map[string]any); ok {
+			extractOpenAIUsage(usage, &u)
 		}
 
 		choices, _ := getNested(obj, "choices").([]any)
@@ -1115,12 +1218,14 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response) {
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
-			"output_tokens": 0,
+			"input_tokens":  u.promptTokens,
+			"output_tokens": u.completionTokens,
 		},
 	})
 
 	emit("message_stop", map[string]any{"type": "message_stop"})
 	log.Printf("  anthropic stream done: hasText=%v tools=%d reason=%s", hasText, len(pendingTools), stopReason)
+	insertRequestRecord(ctx, u, true, 200, "")
 }
 
 func normalizeOpenAIResponse(obj map[string]any) map[string]any {

@@ -20,6 +20,13 @@ func main() {
 	startMode := flag.Bool("start", false, "Build, start proxy, and open admin panel in browser")
 	flag.Parse()
 
+	// 初始化统计/账号数据库（login/list 等模式也需要）。
+	// 失败只警告不 fatal，但 login 等写入账号的模式会因 statsDB==nil 而失败。
+	if err := initStats(); err != nil {
+		log.Printf("WARNING: stats db init failed: %v (database features disabled)", err)
+	}
+	migrateOldAccounts()
+
 	if *startMode {
 		buildAndStart(*host, *port)
 		return

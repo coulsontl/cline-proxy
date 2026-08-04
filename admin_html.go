@@ -7,7 +7,8 @@ const adminHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cline 代理管理面板</title>
 <style>
-:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff}
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--badge-green-bg:#0e4429;--badge-yellow-bg:#3d2e00;--badge-red-bg:#3d1117;--danger-bg:var(--bg3);--danger-bg-hover:#3d1117}
+[data-theme="light"]{--bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--border:#d0d7de;--text:#1f2328;--text2:#656d76;--accent:#0969da;--green:#1a7f37;--red:#cf222e;--yellow:#9a6700;--blue:#0969da;--badge-green-bg:#dafbe1;--badge-yellow-bg:#fff8c5;--badge-red-bg:#ffebe9;--danger-bg:#ffebe9;--danger-bg-hover:#ffd4d0}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
 .layout{display:flex;min-height:100vh}
@@ -40,9 +41,9 @@ table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
 th{color:var(--text2);font-weight:600;font-size:12px}
 .status{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:500}
-.status.active{background:#0e4429;color:var(--green)}
-.status.cooldown{background:#3d2e00;color:var(--yellow)}
-.status.expired{background:#3d1117;color:var(--red)}
+.status.active{background:var(--badge-green-bg);color:var(--green)}
+.status.cooldown{background:var(--badge-yellow-bg);color:var(--yellow)}
+.status.expired{background:var(--badge-red-bg);color:var(--red)}
 .status-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
 .status-dot.active{background:var(--green)}
 .status-dot.cooldown{background:var(--yellow)}
@@ -53,8 +54,8 @@ th{color:var(--text2);font-weight:600;font-size:12px}
 .btn-primary:hover{background:#388bfd}
 .btn-success{background:#1a7f37;border-color:#1a7f37;color:#fff}
 .btn-success:hover{background:#238636}
-.btn-danger{border-color:var(--red);color:var(--red)}
-.btn-danger:hover{background:#3d1117}
+.btn-danger{border-color:var(--red);color:var(--red);background:var(--danger-bg)}
+.btn-danger:hover{background:var(--danger-bg-hover)}
 .btn-sm{padding:3px 10px;font-size:12px}
 input,textarea,select{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:inherit}
 input:focus,textarea:focus{outline:none;border-color:var(--accent)}
@@ -92,10 +93,11 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 <body>
 <div class="layout">
 <div class="sidebar">
-<h1><span>⚡</span>Cline 代理</h1>
+<h1><span>⚡</span>Cline 代理<button id="themeToggle" onclick="toggleTheme()" title="切换主题" style="margin-left:auto;background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px;padding:0 4px">🌙</button></h1>
 <div class="nav-item active" data-tab="dashboard"><span>📊</span> 仪表盘</div>
 <div class="nav-item" data-tab="accounts"><span>👤</span> 账号管理</div>
 <div class="nav-item" data-tab="import"><span>📥</span> 导入账号</div>
+<div class="nav-item" data-tab="stats"><span>📈</span> 请求统计</div>
 <div class="nav-item" data-tab="settings"><span>⚙️</span> 设置</div>
 <div style="margin-top:auto;padding:16px;font-size:12px;color:var(--text2)">
   <div>管理面板: <a href="/admin/" style="color:var(--accent)">/admin/</a></div>
@@ -116,11 +118,21 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 <div class="section">
   <div class="section-title">📋 快捷操作</div>
   <div class="section-body" style="display:flex;gap:8px;flex-wrap:wrap">
-    <button class="btn btn-primary" onclick="switchTab('import')">➕ 添加账号</button>
+    <button class="btn btn-primary" onclick="switchTab('import')">+ 添加账号</button>
     <button class="btn" onclick="refreshAllTokens()">🔄 刷新全部 Token</button>
     <button class="btn" onclick="document.getElementById('fileInput').click()">📄 从文件导入</button>
     <input type="file" id="fileInput" accept=".json,.txt" style="display:none" onchange="handleFileImport(event)">
     <button class="btn" onclick="switchTab('settings');generateKey()">🔑 生成 API 密钥</button>
+  </div>
+</div>
+<div class="section">
+  <div class="section-title">🧠 可用模型与上下文限制</div>
+  <div class="section-body" style="padding:0">
+    <table>
+      <thead><tr><th>模型</th><th style="width:200px">当前限制</th><th style="width:110px"></th></tr></thead>
+      <tbody id="modelLimitBody"><tr><td colspan="3" class="empty">加载中...</td></tr></tbody>
+    </table>
+    <div style="padding:12px;font-size:12px;color:var(--text2)">输入上下文限制：0 或留空表示不限制。请求入参超过该值时将被直接拒绝（HTTP 413），不会转发到上游。</div>
   </div>
 </div>
 </div>
@@ -129,7 +141,7 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 <div class="flex justify-between" style="margin-bottom:16px">
   <h2>👤 账号管理</h2>
   <div style="display:flex;gap:8px">
-    <button class="btn btn-primary btn-sm" onclick="switchTab('import')">➕ 添加</button>
+    <button class="btn btn-primary btn-sm" onclick="switchTab('import')">+ 添加</button>
     <button class="btn btn-sm" onclick="loadAccounts()">🔄 刷新</button>
   </div>
 </div>
@@ -189,7 +201,7 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
       </div>
     </div>
     <div class="form-actions">
-      <button class="btn btn-primary" onclick="addByToken()">➕ 添加账号</button>
+      <button class="btn btn-primary" onclick="addByToken()">+ 添加账号</button>
     </div>
     <div id="tokenResult" style="margin-top:8px"></div>
   </div>
@@ -212,6 +224,47 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 </div>
 </div>
 
+<div id="tab-stats" class="tab-panel" style="display:none">
+<h2>📈 请求统计</h2>
+<div class="flex" style="margin-bottom:16px;gap:8px;align-items:center">
+  <span style="color:var(--text2);font-size:13px">时间范围:</span>
+  <select id="statsDays" onchange="loadStatsPage()" style="width:auto">
+    <option value="1" selected>今天</option>
+    <option value="7">近 7 天</option>
+    <option value="30">近 30 天</option>
+    <option value="90">近 90 天</option>
+  </select>
+  <button class="btn btn-sm" onclick="loadStatsPage()">🔄 刷新</button>
+  <button class="btn btn-sm btn-danger" onclick="clearStats()" style="margin-left:auto">🗑️ 清空统计</button>
+</div>
+<div class="cards" id="statsOverview"><div class="card"><div class="num">-</div><div class="label">加载中...</div></div></div>
+<div class="section">
+  <div class="section-title">📊 按天趋势</div>
+  <div class="section-body" id="statsTrend"><div class="empty">加载中...</div></div>
+</div>
+<div class="section">
+  <div class="section-title">👤 按账号汇总</div>
+  <div class="section-body" style="padding:0">
+    <table><thead><tr><th>账号</th><th>请求</th><th>成功</th><th>错误</th><th>输入</th><th>输出</th><th>总计</th></tr></thead>
+    <tbody id="statsAccountBody"><tr><td colspan="7" class="empty">加载中...</td></tr></tbody></table>
+  </div>
+</div>
+<div class="section">
+  <div class="section-title">🧠 按模型汇总</div>
+  <div class="section-body" style="padding:0">
+    <table><thead><tr><th>模型</th><th>请求</th><th>成功</th><th>错误</th><th>输入</th><th>输出</th><th>总计</th></tr></thead>
+    <tbody id="statsModelBody"><tr><td colspan="7" class="empty">加载中...</td></tr></tbody></table>
+  </div>
+</div>
+<div class="section">
+  <div class="section-title">⚠️ 错误明细</div>
+  <div class="section-body" style="padding:0">
+    <table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态码</th><th>错误信息</th></tr></thead>
+    <tbody id="statsErrorBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody></table>
+  </div>
+</div>
+</div>
+
 <div id="tab-settings" class="tab-panel" style="display:none">
 <h2>⚙️ 设置</h2>
 
@@ -220,19 +273,13 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
   <div class="section-body">
     <p style="color:var(--text2);margin-bottom:12px">生成的密钥可用于客户端访问代理 API（作为 x-api-key 或 Authorization 头）。</p>
     <div class="form-actions" style="margin-bottom:12px">
-      <button class="btn btn-success" onclick="generateKey()">➕ 生成新密钥</button>
+      <button class="btn btn-success" onclick="generateKey()">+ 生成新密钥</button>
     </div>
     <div id="keysList"></div>
     <div id="keyGenResult" style="margin-top:8px"></div>
   </div>
 </div>
 
-<div class="section">
-  <div class="section-title">🧠 可用模型</div>
-  <div class="section-body">
-    <div id="modelsList">加载中...</div>
-  </div>
-</div>
 
 <div class="section">
   <div class="section-title">🔧 代理配置</div>
@@ -277,6 +324,19 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 </div>
 
 <div class="section">
+  <div class="section-title">📝 系统提示词覆盖（override.md）</div>
+  <div class="section-body">
+    <div style="font-size:12px;color:var(--text2);margin-bottom:8px">非空时会作为 system prompt 注入所有请求（OpenAI 格式注入到 messages；Anthropic 格式注入到 system）。留空则不覆盖。</div>
+    <textarea id="overrideContent" placeholder="在此填写覆盖的系统提示词..." style="width:100%;min-height:120px;font-family:monospace;font-size:13px"></textarea>
+    <div class="form-actions" style="margin-top:8px">
+      <button class="btn btn-sm btn-primary" onclick="saveOverride()">💾 保存</button>
+      <button class="btn btn-sm" onclick="loadOverride()">🔄 重新加载</button>
+    </div>
+    <div id="overrideSaveResult" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title">🗑️ 危险操作</div>
   <div class="section-body">
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -305,6 +365,20 @@ function toast(msg, t) {
   setTimeout(() => el.classList.remove('show'), 3500);
 }
 
+// ========== 主题切换 ==========
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  const btn = _('themeToggle');
+  if (btn) btn.textContent = t === 'light' ? '☀️' : '🌙';
+}
+applyTheme(localStorage.getItem('theme') || 'light');
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  localStorage.setItem('theme', next);
+}
+
 // ========== 导航 ==========
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', () => {
@@ -313,9 +387,10 @@ document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.add('active');
     document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
     _('tab-' + el.dataset.tab).style.display = 'block';
-    if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
+    if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); loadModelLimits(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
+    if (el.dataset.tab === 'stats') loadStatsPage();
+    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOverride(); }
   });
 });
 
@@ -325,9 +400,10 @@ function switchTab(name) {
   });
   document.querySelectorAll('.tab-panel').forEach(e => e.style.display = 'none');
   _('tab-' + name).style.display = 'block';
-  if (name === 'dashboard') { loadStats(); loadAccounts(); }
+  if (name === 'dashboard') { loadStats(); loadAccounts(); loadModelLimits(); }
   if (name === 'accounts') loadAccounts();
-  if (name === 'settings') { loadKeys(); loadModels(); }
+  if (name === 'stats') loadStatsPage();
+  if (name === 'settings') { loadKeys(); loadOverride(); }
 }
 
 // 导入子标签
@@ -623,16 +699,6 @@ async function saveHeaders() {
 }
 
 // ========== 模型列表 ==========
-async function loadModels() {
-  try {
-    const d = await api('GET', '/models');
-    const models = d.data.models || [];
-    _('modelsList').innerHTML = models.map(m =>
-      '<span class="model-tag ' + (m.cost || 'free') + '">' + esc(m.id) + '</span>'
-    ).join('') || '<div class="empty">暂无模型</div>';
-  } catch (e) { _('modelsList').textContent = '加载失败'; }
-}
-
 // ========== 配置加载 ==========
 async function loadConfig() {
   try {
@@ -656,13 +722,196 @@ async function loadConfig() {
   } catch (e) { /* ignore */ }
 }
 
+// ========== override.md 编辑 ==========
+async function loadOverride() {
+  try {
+    const d = await api('GET', '/override');
+    _('overrideContent').value = d.data.content || '';
+  } catch (e) { toast('加载 override 失败: ' + e.message, 'error'); }
+}
+
+async function saveOverride() {
+  const content = _('overrideContent').value;
+  try {
+    await api('POST', '/override', { content });
+    _('overrideSaveResult').innerHTML = '<div style="color:var(--green);font-size:12px">✓ 已保存（' + content.length + ' 字节）</div>';
+    toast('override.md 已保存', 'success');
+    setTimeout(() => { _('overrideSaveResult').innerHTML = ''; }, 5000);
+  } catch (e) {
+    _('overrideSaveResult').innerHTML = '<div style="color:var(--red);font-size:12px">✕ ' + esc(e.message) + '</div>';
+    toast('保存失败: ' + e.message, 'error');
+  }
+}
+
+// ========== 请求统计 ==========
+async function loadStatsPage() {
+  const days = _('statsDays') ? _('statsDays').value : 7;
+  const results = await Promise.all([
+    api('GET', '/stats/usage?days=' + days),
+    api('GET', '/stats/by-account?days=' + days),
+    api('GET', '/stats/by-model?days=' + days),
+    api('GET', '/stats/errors?days=' + days + '&limit=50')
+  ]).catch(err => { toast('加载统计失败: ' + err.message, 'error'); return null; });
+  if (!results) return;
+  const [u, a, m, e] = results;
+  renderStatsOverview(u.data.overview);
+  renderStatsTrend(u.data.trend);
+  renderStatsAccounts(a.data.accounts);
+  renderStatsModels(m.data.models);
+  renderStatsErrors(e.data.errors);
+}
+
+function statCard(num, label, color) {
+  return '<div class="card"><div class="num ' + (color||'') + '">' + (num||0) + '</div><div class="label">' + label + '</div></div>';
+}
+
+function renderStatsOverview(o) {
+  if (!o) { _('statsOverview').innerHTML = statCard('-', '无数据', ''); return; }
+  _('statsOverview').innerHTML =
+    statCard(o.total_requests, '总请求', 'blue') +
+    statCard(o.success, '成功', 'green') +
+    statCard(o.errors, '失败', 'red') +
+    statCard(o.prompt_tokens, '输入 Tokens', 'blue') +
+    statCard(o.completion_tokens, '输出 Tokens', 'green') +
+    statCard(o.total_tokens, '总 Tokens', 'yellow');
+}
+
+function renderStatsTrend(trend) {
+  if (!trend || trend.length === 0) { _('statsTrend').innerHTML = '<div class="empty">无数据</div>'; return; }
+  const max = Math.max.apply(null, trend.map(t => t.requests || 0)) || 1;
+  _('statsTrend').innerHTML = trend.map(t => {
+    const pct = Math.round((t.requests / max) * 100);
+    return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
+      '<span style="width:80px;font-family:monospace;font-size:11px;color:var(--text2)">' + esc(t.date) + '</span>' +
+      '<div style="flex:1;background:var(--bg3);border-radius:4px;height:18px;overflow:hidden">' +
+        '<div style="width:' + pct + '%;height:100%;background:var(--accent);opacity:0.6"></div></div>' +
+      '<span style="width:60px;text-align:right;font-size:11px">' + (t.requests||0) + ' 次</span>' +
+      '<span style="width:90px;text-align:right;font-size:11px;color:var(--text2)">' + (t.total_tokens||0) + ' tok</span>' +
+    '</div>';
+  }).join('');
+}
+
+function statRow(first, r) {
+  return '<tr>' +
+    '<td>' + esc(first) + '</td>' +
+    '<td>' + (r.requests||0) + '</td>' +
+    '<td style="color:var(--green)">' + (r.success||0) + '</td>' +
+    '<td style="color:var(--red)">' + (r.errors||0) + '</td>' +
+    '<td>' + (r.prompt_tokens||0) + '</td>' +
+    '<td>' + (r.completion_tokens||0) + '</td>' +
+    '<td>' + (r.total_tokens||0) + '</td>' +
+  '</tr>';
+}
+
+function renderStatsAccounts(list) {
+  if (!list || list.length === 0) { _('statsAccountBody').innerHTML = '<tr><td colspan="7" class="empty">无数据</td></tr>'; return; }
+  _('statsAccountBody').innerHTML = list.map(a => statRow(a.email, a)).join('');
+}
+
+function renderStatsModels(list) {
+  if (!list || list.length === 0) { _('statsModelBody').innerHTML = '<tr><td colspan="7" class="empty">无数据</td></tr>'; return; }
+  _('statsModelBody').innerHTML = list.map(m => statRow(m.model, m)).join('');
+}
+
+function renderStatsErrors(list) {
+  if (!list || list.length === 0) { _('statsErrorBody').innerHTML = '<tr><td colspan="5" class="empty">无错误记录</td></tr>'; return; }
+  _('statsErrorBody').innerHTML = list.map(e => {
+    const msg = e.error_message || '';
+    const preview = esc(msg.slice(0, 80)) + (msg.length > 80 ? '...' : '');
+    return '<tr>' +
+      '<td class="mono" style="font-size:11px">' + esc(e.created_at) + '</td>' +
+      '<td>' + esc(e.account_email) + '</td>' +
+      '<td style="font-size:12px">' + esc(e.model) + '</td>' +
+      '<td>' + (e.status_code || '-') + '</td>' +
+      '<td style="max-width:420px"><details><summary style="cursor:pointer;color:var(--text2);font-size:12px">' + preview +
+        '</summary><div style="margin-top:6px;white-space:pre-wrap;word-break:break-all;font-family:monospace;font-size:11px;color:var(--red)">' +
+        esc(msg) + '</div></details></td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function clearStats() {
+  if (!confirm('确定清空全部统计记录？不可撤销！')) return;
+  try {
+    const d = await api('POST', '/stats/clear', { beforeDays: 0 });
+    toast(d.message || '已清空', 'success');
+    loadStatsPage();
+  } catch (err) { toast('清空失败: ' + err.message, 'error'); }
+}
+
+// ========== 模型上下文限制 ==========
+async function loadModelLimits() {
+  try {
+    const d = await api('GET', '/model-limits');
+    const models = d.data.models || {};
+    const tbody = _('modelLimitBody');
+    const entries = Object.entries(models);
+    if (entries.length === 0) { tbody.innerHTML = '<tr><td colspan="3" class="empty">无可用模型</td></tr>'; return; }
+    tbody.innerHTML = entries.map(([id, limit], i) => {
+      const el = 'ml-' + i;
+      const disp = (limit > 0 ? limit.toLocaleString() + ' tokens' : '不限制');
+      return '<tr>' +
+        '<td style="font-size:12px">' + esc(id) + '</td>' +
+        '<td style="font-size:12px;white-space:nowrap">' +
+          '<span id="' + el + '-label">' + disp + '</span>' +
+          '<span id="' + el + '-edit" style="display:none;gap:6px;align-items:center;white-space:nowrap">' +
+            '<input type="number" min="0" step="1000" id="' + el + '-input" value="' + (limit || 0) + '" placeholder="0=不限制" style="width:160px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px">' +
+          '</span>' +
+        '</td>' +
+        '<td style="white-space:nowrap">' +
+          '<button id="' + el + '-btn" onclick="editModelLimit(' + i + ')" title="编辑限制" style="background:none;border:none;cursor:pointer;padding:2px;color:var(--text2);line-height:0">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>' +
+          '</button>' +
+          '<span id="' + el + '-actions" style="display:none;gap:6px;white-space:nowrap">' +
+            '<button class="btn btn-sm btn-primary" onclick="saveModelLimit(' + i + ',\'' + esc(id) + '\')">保存</button>' +
+            '<button class="btn btn-sm" onclick="cancelEditModelLimit(' + i + ')">取消</button>' +
+          '</span>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (e) { _('modelLimitBody').innerHTML = '<tr><td colspan="3" class="empty">加载失败</td></tr>'; }
+}
+
+function editModelLimit(i) {
+  _('modelLimitBody').querySelectorAll('[id$="-label"]').forEach(el => el.style.display = 'none');
+  _('modelLimitBody').querySelectorAll('[id$="-edit"]').forEach(el => el.style.display = 'none');
+  _('modelLimitBody').querySelectorAll('[id$="-actions"]').forEach(el => el.style.display = 'none');
+  _('modelLimitBody').querySelectorAll('[id$="-btn"]').forEach(el => el.style.display = '');
+  _('ml-' + i + '-label').style.display = 'none';
+  _('ml-' + i + '-edit').style.display = 'inline-flex';
+  _('ml-' + i + '-actions').style.display = 'inline-flex';
+  _('ml-' + i + '-btn').style.display = 'none';
+}
+
+function cancelEditModelLimit(i) {
+  _('ml-' + i + '-label').style.display = '';
+  _('ml-' + i + '-edit').style.display = 'none';
+  _('ml-' + i + '-actions').style.display = 'none';
+  _('ml-' + i + '-btn').style.display = '';
+}
+
+async function saveModelLimit(i, modelId) {
+  const input = _('ml-' + i + '-input');
+  const limit = parseInt(input && input.value, 10) || 0;
+  try {
+    await api('POST', '/model-limits/update', { modelId, limit });
+    _('ml-' + i + '-label').textContent = (limit > 0 ? limit.toLocaleString() + ' tokens' : '不限制');
+    _('ml-' + i + '-label').style.display = '';
+    _('ml-' + i + '-edit').style.display = 'none';
+    _('ml-' + i + '-actions').style.display = 'none';
+    _('ml-' + i + '-btn').style.display = '';
+    toast('已保存 ' + modelId + ' 限制: ' + (limit || '不限制'), 'success');
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
 // ========== 初始化 ==========
 if (_('footerApiAddr')) _('footerApiAddr').innerText = window.location.origin;
 loadStats();
 loadAccounts();
 loadKeys();
-loadModels();
 loadConfig();
+loadOverride();
+loadModelLimits();
 setInterval(() => { loadStats(); }, 10000);
 </script>
 </body>

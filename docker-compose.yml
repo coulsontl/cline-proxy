@@ -8,7 +8,8 @@ services:
     ports:
       - "3457:3457"
     volumes:
-      - ./.cline-accounts.json:/app/.cline-accounts.json
-      - ./override.md:/app/override.md:ro
+      # 账号池与统计记录均持久化在 data 目录（SQLite stats.db）
+      - ./data:/app/data
+      - ./override.md:/app/override.md
     environment:
       - PORT=3457

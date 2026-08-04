@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,47 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models", corsHandler(handleAdminModels))
 	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
+	mux.HandleFunc("/admin/api/stats/usage", corsHandler(handleStatsUsage))
+	mux.HandleFunc("/admin/api/stats/by-account", corsHandler(handleStatsByAccount))
+	mux.HandleFunc("/admin/api/stats/by-model", corsHandler(handleStatsByModel))
+	mux.HandleFunc("/admin/api/stats/errors", corsHandler(handleStatsErrors))
+	mux.HandleFunc("/admin/api/stats/clear", corsHandler(handleStatsClear))
+	mux.HandleFunc("/admin/api/override", corsHandler(handleOverride))
+	mux.HandleFunc("/admin/api/model-limits", corsHandler(handleModelLimits))
+	mux.HandleFunc("/admin/api/model-limits/update", corsHandler(handleModelLimitUpdate))
+}
+
+// GET /admin/api/override 返回 override.md 内容；POST 保存。
+func handleOverride(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		data, err := os.ReadFile(overridePath)
+		content := ""
+		if err == nil {
+			content = string(data)
+		}
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"content": content}})
+	case "POST":
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+			return
+		}
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+			return
+		}
+		if err := os.WriteFile(overridePath, []byte(req.Content), 0644); err != nil {
+			writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "write override.md: " + err.Error()})
+			return
+		}
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "override.md 已保存"})
+	default:
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+	}
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +182,11 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 		acc.RefreshToken = resp.Data.RefreshToken
 	}
 
-	addAccount(acc)
+	if err := addAccount(acc); err != nil {
+		log.Printf("Account add failed: %v", err)
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "add account failed: " + err.Error()})
+		return
+	}
 	log.Printf("Account added via API: %s", req.Email)
 
 	writeAPI(w, http.StatusOK, apiResponse{
@@ -262,7 +308,15 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			Status:       "active",
 			CreatedAt:    time.Now(),
 		}
-		addAccount(acc)
+		if err := addAccount(acc); err != nil {
+			log.Printf("OAuth account add failed: %v", err)
+			oauthSessionsMu.Lock()
+			state.Done = true
+			state.Success = false
+			state.Error = "add account failed: " + err.Error()
+			oauthSessionsMu.Unlock()
+			return
+		}
 
 		oauthSessionsMu.Lock()
 		state.Done = true
@@ -377,7 +431,10 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 				Status:       "active",
 				CreatedAt:    time.Now(),
 			}
-			addAccount(acc)
+			if err := addAccount(acc); err != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", email, err))
+				continue
+			}
 			imported++
 		}
 	}
@@ -451,7 +508,10 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 			Status:       "active",
 			CreatedAt:    time.Now(),
 		}
-		addAccount(acc)
+		if err := addAccount(acc); err != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", email, err))
+			continue
+		}
 		imported++
 	}
 
@@ -473,13 +533,11 @@ func handleAdminRefreshAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := loadPool()
-	poolMu.Lock()
 	for _, a := range p.Accounts {
 		if err := refreshAccountToken(a); err != nil {
 			log.Printf("Refresh failed for %s: %v", a.Email, err)
 		}
 	}
-	poolMu.Unlock()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "All tokens refreshed"})
 }
 
@@ -489,10 +547,10 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	poolMu.Lock()
-	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}}
-	poolMu.Unlock()
-	savePool()
+	if statsDB != nil {
+		_, _ = statsDB.Exec(`DELETE FROM accounts`)
+		_, _ = statsDB.Exec(`UPDATE proxy_state SET current_idx=0 WHERE id=1`)
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "All accounts deleted"})
 }
 
@@ -587,11 +645,7 @@ func handleAdminGenerateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := fmt.Sprintf("cline_%x_%x", time.Now().UnixMilli(), time.Now().UnixNano()%1000000)
-	p := loadPool()
-	poolMu.Lock()
-	p.Keys = append(p.Keys, key)
-	poolMu.Unlock()
-	savePool()
+	addKey(key)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"key": key}})
 }
 
@@ -614,16 +668,7 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
 		return
 	}
-	p := loadPool()
-	poolMu.Lock()
-	for i, k := range p.Keys {
-		if k == req.Key {
-			p.Keys = append(p.Keys[:i], p.Keys[i+1:]...)
-			break
-		}
-	}
-	poolMu.Unlock()
-	savePool()
+	removeKey(req.Key)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Key deleted"})
 }
 
@@ -638,7 +683,7 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"address":      addr,
 		"strategy":     cfg.Strategy,
 		"version":      "go-1.1",
-		"poolPath":     poolPath,
+		"poolPath":     statsPath,
 		"defaultModel": defaultModel,
 		"headers":      cfg.Headers,
 	}})
@@ -697,13 +742,12 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-// GET /admin/api/models
+// GET /admin/api/models 返回当前上游 free 缓存的可选模型。
 func handleAdminModels(w http.ResponseWriter, r *http.Request) {
-	models := []map[string]any{
-		{"id": "cline-free/glm-5.2", "provider": "zai", "cost": "free", "status": "active"},
-		{"id": "cline-pass/glm-5.2", "provider": "zai", "cost": "pass", "status": "active"},
-		{"id": "cline-pass/deepseek-v4-flash", "provider": "deepseek", "cost": "pass", "status": "active"},
-		{"id": "cline-pass/qwen3.7-max", "provider": "qwen", "cost": "pass", "status": "active"},
+	ids := listFreeModels()
+	models := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, map[string]any{"id": id, "cost": "free", "status": "active"})
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": models}})
 }
