@@ -611,7 +611,7 @@ func defaultProxyConfig() *proxyConfigData {
 			"HTTP-Referer":       "https://cline.bot",
 			"X-Title":            "Cline",
 			"X-IS-MULTIROOT":     "false",
-			"X-CLIENT-TYPE":      "cline-cli",
+			"X-CLIENT-TYPE":      "cline-sdk",
 			"X-CLIENT-VERSION":   "3.0.47",
 			"X-PLATFORM":         "terminal",
 			"X-PLATFORM-VERSION": "3.0.47",

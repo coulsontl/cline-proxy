@@ -761,8 +761,18 @@ async function loadStatsPage() {
   renderStatsErrors(e.data.errors);
 }
 
+function fmtNum(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return (n === undefined || n === null) ? '0' : String(n);
+  const abs = Math.abs(v);
+  if (abs >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (abs >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (abs >= 1e3) return (v / 1e3).toFixed(2) + 'K';
+  return String(v);
+}
+
 function statCard(num, label, color) {
-  return '<div class="card"><div class="num ' + (color||'') + '">' + (num||0) + '</div><div class="label">' + label + '</div></div>';
+  return '<div class="card"><div class="num ' + (color||'') + '">' + fmtNum(num) + '</div><div class="label">' + label + '</div></div>';
 }
 
 function renderStatsOverview(o) {
@@ -786,7 +796,7 @@ function renderStatsTrend(trend) {
       '<div style="flex:1;background:var(--bg3);border-radius:4px;height:18px;overflow:hidden">' +
         '<div style="width:' + pct + '%;height:100%;background:var(--accent);opacity:0.6"></div></div>' +
       '<span style="width:60px;text-align:right;font-size:11px">' + (t.requests||0) + ' 次</span>' +
-      '<span style="width:90px;text-align:right;font-size:11px;color:var(--text2)">' + (t.total_tokens||0) + ' tok</span>' +
+      '<span style="width:90px;text-align:right;font-size:11px;color:var(--text2)">' + fmtNum(t.total_tokens) + ' tok</span>' +
     '</div>';
   }).join('');
 }
@@ -797,9 +807,9 @@ function statRow(first, r) {
     '<td>' + (r.requests||0) + '</td>' +
     '<td style="color:var(--green)">' + (r.success||0) + '</td>' +
     '<td style="color:var(--red)">' + (r.errors||0) + '</td>' +
-    '<td>' + (r.prompt_tokens||0) + '</td>' +
-    '<td>' + (r.completion_tokens||0) + '</td>' +
-    '<td>' + (r.total_tokens||0) + '</td>' +
+    '<td>' + fmtNum(r.prompt_tokens) + '</td>' +
+    '<td>' + fmtNum(r.completion_tokens) + '</td>' +
+    '<td>' + fmtNum(r.total_tokens) + '</td>' +
   '</tr>';
 }
 
@@ -849,7 +859,7 @@ async function loadModelLimits() {
     if (entries.length === 0) { tbody.innerHTML = '<tr><td colspan="3" class="empty">无可用模型</td></tr>'; return; }
     tbody.innerHTML = entries.map(([id, limit], i) => {
       const el = 'ml-' + i;
-      const disp = (limit > 0 ? limit.toLocaleString() + ' tokens' : '不限制');
+      const disp = (limit > 0 ? fmtNum(limit) + ' tokens' : '不限制');
       return '<tr>' +
         '<td style="font-size:12px">' + esc(id) + '</td>' +
         '<td style="font-size:12px;white-space:nowrap">' +
@@ -895,7 +905,7 @@ async function saveModelLimit(i, modelId) {
   const limit = parseInt(input && input.value, 10) || 0;
   try {
     await api('POST', '/model-limits/update', { modelId, limit });
-    _('ml-' + i + '-label').textContent = (limit > 0 ? limit.toLocaleString() + ' tokens' : '不限制');
+    _('ml-' + i + '-label').textContent = (limit > 0 ? fmtNum(limit) + ' tokens' : '不限制');
     _('ml-' + i + '-label').style.display = '';
     _('ml-' + i + '-edit').style.display = 'none';
     _('ml-' + i + '-actions').style.display = 'none';
