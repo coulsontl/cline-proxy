@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -69,17 +70,20 @@ func initStats() error {
 		`PRAGMA busy_timeout=5000`,
 		// 账号池（替代 .cline-accounts.json 的 accounts + currentIdx）
 		`CREATE TABLE IF NOT EXISTS accounts (
-  account_id     TEXT    PRIMARY KEY,
-  email          TEXT    NOT NULL DEFAULT '',
-  refresh_token  TEXT    NOT NULL,
-  access_token   TEXT    NOT NULL DEFAULT '',
-  expires_at     INTEGER NOT NULL DEFAULT 0,
-  status         TEXT    NOT NULL DEFAULT 'active',
-  cooldown_until INTEGER NOT NULL DEFAULT 0,
-  fail_count     INTEGER NOT NULL DEFAULT 0,
-  usage_count    INTEGER NOT NULL DEFAULT 0,
-  last_used      INTEGER NOT NULL DEFAULT 0,
-  created_at     INTEGER NOT NULL DEFAULT 0
+  account_id        TEXT    PRIMARY KEY,
+  email             TEXT    NOT NULL DEFAULT '',
+  refresh_token     TEXT    NOT NULL,
+  access_token      TEXT    NOT NULL DEFAULT '',
+  expires_at        INTEGER NOT NULL DEFAULT 0,
+  status            TEXT    NOT NULL DEFAULT 'active',
+  cooldown_until    INTEGER NOT NULL DEFAULT 0,
+  fail_count        INTEGER NOT NULL DEFAULT 0,
+  usage_count       INTEGER NOT NULL DEFAULT 0,
+  usage_count_today INTEGER NOT NULL DEFAULT 0,
+  usage_date        TEXT    NOT NULL DEFAULT '',
+  last_reason       TEXT    NOT NULL DEFAULT '',
+  last_used         INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL DEFAULT 0
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_acc_status ON accounts(status)`,
 		// API 密钥
@@ -123,6 +127,22 @@ func initStats() error {
 		if _, err := d.Exec(s); err != nil {
 			d.Close()
 			return fmt.Errorf("init stats schema: %w (stmt=%s)", err, s)
+		}
+	}
+
+	// 迁移旧库：accounts 表补充新增列（列已存在时忽略 duplicate column 错误）。
+	migrateStmts := []string{
+		`ALTER TABLE accounts ADD COLUMN usage_count_today INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN usage_date TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN last_reason TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, s := range migrateStmts {
+		if _, err := d.Exec(s); err != nil {
+			// 旧库可能已有部分列，忽略"列已存在"即可
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				d.Close()
+				return fmt.Errorf("migrate stats schema: %w (stmt=%s)", err, s)
+			}
 		}
 	}
 
@@ -222,12 +242,12 @@ type modelStat struct {
 }
 
 type errorRow struct {
-	ID            int64  `json:"id"`
-	CreatedAt     string `json:"created_at"`
-	AccountEmail  string `json:"account_email"`
-	Model         string `json:"model"`
-	StatusCode    int    `json:"status_code"`
-	ErrorMessage  string `json:"error_message"`
+	ID           int64  `json:"id"`
+	CreatedAt    string `json:"created_at"`
+	AccountEmail string `json:"account_email"`
+	Model        string `json:"model"`
+	StatusCode   int    `json:"status_code"`
+	ErrorMessage string `json:"error_message"`
 }
 
 func queryUsageOverview(cutoff time.Time) (usageOverview, error) {
@@ -421,4 +441,3 @@ func allModelLimits() map[string]int {
 	}
 	return out
 }
-

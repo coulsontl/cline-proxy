@@ -14,9 +14,12 @@ import (
 	"time"
 )
 
+var defaultModel = "deepseek/deepseek-v4-flash"
+
+var proxyListenAddress = "0.0.0.0:3457"
+
 const (
-	defaultModel          = "cline-free/glm-5.2"
-	defaultMaxTokens      = 128000
+	defaultMaxTokens       = 128000
 	defaultReasoningEffort = "high"
 )
 
@@ -28,19 +31,24 @@ var passThroughKeys = []string{
 }
 
 type chatRequest struct {
-	Model       string          `json:"model"`
-	Messages    json.RawMessage `json:"messages"`
-	Stream      bool            `json:"stream,omitempty"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty"`
-	Tools       json.RawMessage `json:"tools,omitempty"`
-	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
-	ReasoningEffort string     `json:"reasoning_effort,omitempty"`
-	ReasoningEffortAlt string  `json:"reasoningEffort,omitempty"`
-	Extra       map[string]any `json:"-"`
+	Model               string          `json:"model"`
+	Messages            json.RawMessage `json:"messages"`
+	Stream              bool            `json:"stream,omitempty"`
+	MaxTokens           int             `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Tools               json.RawMessage `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	ReasoningEffortAlt  string          `json:"reasoningEffort,omitempty"`
+	Extra               map[string]any  `json:"-"`
 }
 
 func startProxy(host string, port int) error {
+	if strings.TrimSpace(host) == "" {
+		host = "0.0.0.0"
+	}
+	initLogFile()
+
 	p := loadPool()
 	activeCount := 0
 	for _, a := range p.Accounts {
@@ -58,16 +66,26 @@ func startProxy(host string, port int) error {
 	log.Printf("Loaded %d active accounts from pool", activeCount)
 
 	// 后台定期拉取上游 free 模型列表并校验请求模型。
-	initFreeModels()
+	// startModelsRefresher 在下方启动，initFreeModels 由 models.go 取代。
 
 	freePort(port)
 
+	startModelsRefresher()
+
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/admin/", http.StatusFound)
+	})
 
 	mux.HandleFunc("/v1/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
 		info := map[string]any{
-			"status":       "ok",
-			"version":      "go-1.1",
+			"status":         "ok",
+			"version":        "go-1.1",
 			"activeAccounts": activeCount,
 		}
 		writeJSON(w, http.StatusOK, info)
@@ -121,12 +139,8 @@ func startProxy(host string, port int) error {
 	}
 
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
-		ids := listFreeModels()
-		data := make([]map[string]any, 0, len(ids))
-		for _, id := range ids {
-			data = append(data, map[string]any{"id": id, "object": "model", "created": time.Now().UnixMilli(), "owned_by": "cline"})
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+		ensureModelsFresh()
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": apiModelList()})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/models", modelsHandler)
@@ -225,7 +239,19 @@ func startProxy(host string, port int) error {
 			}
 		}
 
-		resp, ctx, err := callClineAPI(params, isStream)
+		upstreamStream := isStream
+		if !isStream {
+			m := getDefaultModel()
+			if mm, ok := params["model"].(string); ok && mm != "" {
+				m = normalizeRequestModel(mm)
+			}
+			if modelNeedsStream(m) {
+				upstreamStream = true
+				log.Printf("  model %s requires stream: forcing upstream stream, will aggregate", m)
+			}
+		}
+
+		resp, ctx, err := callClineAPI(params, upstreamStream)
 		ctx.apiFormat = "openai"
 		if err != nil {
 			log.Printf("  api error: %v", err)
@@ -239,9 +265,34 @@ func startProxy(host string, port int) error {
 
 		if isStream {
 			handleStreamResponse(w, resp, ctx)
-		} else {
-			handleNonStreamResponse(w, resp, ctx)
+			return
 		}
+
+		if upstreamStream {
+			out, err := collectStreamResponse(resp)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+				})
+				return
+			}
+			out = normalizeOpenAIResponse(out)
+			contentLen := 0
+			if c, ok := getNested(out, "choices", 0, "message", "content").(string); ok {
+				contentLen = len(c)
+			}
+			log.Printf("  nonstream (aggregated): model=%v content_len=%d finish=%v",
+				out["model"], contentLen, getNested(out, "choices", 0, "finish_reason"))
+			var u tokenUsage
+			if usage, ok := out["usage"].(map[string]any); ok {
+				extractOpenAIUsage(usage, &u)
+			}
+			writeJSON(w, http.StatusOK, out)
+			insertRequestRecord(ctx, u, true, 200, "")
+			return
+		}
+
+		handleNonStreamResponse(w, resp, ctx)
 	})
 	mux.HandleFunc("/v1/chat/completions", chatHandler)
 	mux.HandleFunc("/chat/completions", chatHandler)
@@ -261,6 +312,7 @@ func startProxy(host string, port int) error {
 		host = "0.0.0.0"
 	}
 	addr := fmt.Sprintf("%s:%d", host, port)
+	proxyListenAddress = addr
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -273,11 +325,24 @@ func startProxy(host string, port int) error {
 	fmt.Printf("  Listen: http://%s\n", addr)
 	fmt.Printf("  API:    http://%s/v1\n", addr)
 	fmt.Println("  API Key: any value")
-	fmt.Printf("  Model:   %s\n", defaultModel)
+	fmt.Printf("  Model:   %s (auto-detected)\n", getDefaultModel())
 	fmt.Printf("  Accounts: %d total, %d active\n", len(loadPool().Accounts), activeCount)
 	fmt.Println(strings.Repeat("=", 58))
 
 	return server.ListenAndServe()
+}
+
+// initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
+// 控制台窗口滚动内容有限，文件可完整保留所有日志。
+func initLogFile() {
+	path := resolveDataPath("cline-proxy.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("  open log file failed: %v", err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.Printf("========== proxy started, log file: %s ==========", path)
 }
 
 func corsHandler(h http.HandlerFunc) http.HandlerFunc {
@@ -324,15 +389,15 @@ func buildUpstreamBody(params map[string]any, stream bool) map[string]any {
 		maxTokens = int(mt)
 	}
 
-	model := defaultModel
+	model := getDefaultModel()
 	if m, ok := params["model"].(string); ok && m != "" {
-		model = m
+		model = normalizeRequestModel(m)
 	}
 
 	body := map[string]any{
-		"model":        model,
-		"max_tokens":   maxTokens,
-		"session_id":   sessionID,
+		"model":            model,
+		"max_tokens":       maxTokens,
+		"session_id":       sessionID,
 		"reasoning_effort": defaultReasoningEffort,
 	}
 
@@ -388,7 +453,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 	acc := pickAccount()
 	if acc == nil {
 		ctx.accountEmail = "no_account"
-		return nil, ctx, fmt.Errorf("no active accounts available. Use --login or admin API to add accounts")
+		return nil, ctx, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 	ctx.accountEmail = acc.Email
 
@@ -423,7 +488,8 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// 网络错误：按确认不触发退避，保持账号可重试。
+		// 网络错误：临时短冷却 5 分钟
+		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
 		return nil, ctx, fmt.Errorf("upstream request: %w", err)
 	}
 
@@ -440,10 +506,14 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
 				ctx.statusCode = 401
+				acc.Status = "expired"
+				_, _ = statsDBExec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
 				return nil, ctx, fmt.Errorf("account %s token expired permanently", acc.Email)
 			}
 		} else {
 			ctx.statusCode = 401
+			acc.Status = "expired"
+			_, _ = statsDBExec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
 			return nil, ctx, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
 	}
@@ -452,9 +522,15 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		ctx.statusCode = resp.StatusCode
-		// 429 限流触发指数退避冷却
+		// 429 限流：优先使用上游返回的明确等待时长，否则指数退避
 		if resp.StatusCode == 429 {
-			markCooldown(acc)
+			reason := truncate(string(bodyBytes), 500)
+			duration := parseInferenceCapDuration(string(bodyBytes))
+			if duration <= 0 {
+				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
+			}
+			markCooldown(acc, duration, "429: "+reason)
+			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
 		return nil, ctx, fmt.Errorf("API %d: %s", resp.StatusCode, truncate(string(bodyBytes), 500))
 	}
@@ -601,6 +677,147 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx
 	insertRequestRecord(ctx, u, true, 200, "")
 }
 
+func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
+	var (
+		model        string
+		content      strings.Builder
+		finishReason string
+		usage        map[string]any
+		toolCalls    []any
+		toolCallIdx  = -1
+		curToolCall  map[string]any
+		curArgs      strings.Builder
+	)
+
+	reader := bufio.NewReader(upstream.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF && err != bufio.ErrBufferFull {
+				break
+			}
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(line[5:])
+			if payload == "" || payload == "[DONE]" {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
+			var obj map[string]any
+			if json.Unmarshal([]byte(payload), &obj) != nil {
+				continue
+			}
+			if data, ok := obj["data"]; ok {
+				if d, ok := data.(map[string]any); ok {
+					obj = d
+				}
+			}
+			if m, ok := obj["model"].(string); ok && m != "" {
+				model = m
+			}
+			if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+				usage = u
+			}
+			choices, _ := getNested(obj, "choices").([]any)
+			if len(choices) == 0 {
+				continue
+			}
+			choice, _ := choices[0].(map[string]any)
+			if choice == nil {
+				continue
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if delta == nil {
+				delta = choice
+			}
+			if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+				finishReason = fr
+			}
+			if c, ok := delta["content"].(string); ok && c != "" {
+				content.WriteString(c)
+			}
+			if tcRaw, ok := delta["tool_calls"].([]any); ok {
+				for _, tc := range tcRaw {
+					tcMap, _ := tc.(map[string]any)
+					if tcMap == nil {
+						continue
+					}
+					idx := 0
+					if i, ok := tcMap["index"].(float64); ok {
+						idx = int(i)
+					}
+					if idx != toolCallIdx {
+						if curToolCall != nil {
+							curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
+							toolCalls = append(toolCalls, curToolCall)
+						}
+						curToolCall = map[string]any{
+							"id":       tcMap["id"],
+							"type":     "function",
+							"function": map[string]any{"name": "", "arguments": ""},
+						}
+						curArgs.Reset()
+						toolCallIdx = idx
+					}
+					if fn, ok := tcMap["function"].(map[string]any); ok {
+						if n, ok := fn["name"].(string); ok && n != "" {
+							curToolCall["function"].(map[string]any)["name"] = n
+						}
+						if a, ok := fn["arguments"].(string); ok && a != "" {
+							curArgs.WriteString(a)
+						}
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	if curToolCall != nil {
+		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
+		toolCalls = append(toolCalls, curToolCall)
+	}
+
+	message := map[string]any{
+		"role":    "assistant",
+		"content": content.String(),
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+	choice := map[string]any{
+		"index":         0,
+		"message":       message,
+		"finish_reason": finishReason,
+	}
+	out := map[string]any{
+		"id":      "chatcmpl_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{choice},
+	}
+	if usage != nil {
+		out["usage"] = usage
+	}
+	return out, nil
+}
+
+func modelNeedsStream(modelID string) bool {
+	initModelsCache()
+	modelsMu.Lock()
+	defer modelsMu.Unlock()
+	if m, ok := modelsCache[modelID]; ok && m.RequiresStream {
+		return true
+	}
+	return false
+}
+
 // Anthropic Messages API support
 type anthropicMsg struct {
 	Role    string `json:"role"`
@@ -634,9 +851,16 @@ type anthropicReq struct {
 func loadOverrideContent() string {
 	data, err := os.ReadFile(overridePath)
 	if err != nil {
+		// override.md 是可选功能，文件不存在时静默使用客户端自带提示词
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	content := strings.TrimSpace(string(data))
+	if content != "" {
+		log.Printf("  using override.md as system prompt (%d bytes)", len(content))
+	} else {
+		log.Printf("  override.md is empty, using client system prompt")
+	}
+	return content
 }
 
 func extractStringContent(raw json.RawMessage) string {
@@ -731,7 +955,7 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		case []any:
 			textParts := []string{}
 			var toolCalls []any
-			var toolResult *map[string]any
+			var toolResults []map[string]any
 
 			for _, block := range c {
 				if b, ok := block.(map[string]any); ok {
@@ -761,12 +985,15 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 						}
 						toolCalls = append(toolCalls, tc)
 					case "tool_result":
-						tr := map[string]any{
-							"role":         "tool",
-							"content":      b["content"],
-							"tool_call_id": b["tool_use_id"],
+						toolCallID, _ := b["tool_use_id"].(string)
+						if toolCallID == "" {
+							continue
 						}
-						toolResult = &tr
+						toolResults = append(toolResults, map[string]any{
+							"role":         "tool",
+							"content":      anthropicContentToString(b["content"]),
+							"tool_call_id": toolCallID,
+						})
 					}
 				}
 			}
@@ -778,8 +1005,14 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 					"tool_calls": toolCalls,
 				}
 				msgs = append(msgs, msg)
-			} else if m.Role == "user" && toolResult != nil {
-				msgs = append(msgs, *toolResult)
+				log.Printf("  anthropic req: assistant tool_calls=%d", len(toolCalls))
+			} else if m.Role == "user" && len(toolResults) > 0 {
+				for _, tr := range toolResults {
+					msgs = append(msgs, tr)
+					content, _ := tr["content"].(string)
+					id, _ := tr["tool_call_id"].(string)
+					log.Printf("  anthropic req: tool_result id=%s content_len=%d prefix=%s", id, len(content), truncate(content, 400))
+				}
 			} else {
 				content := strings.Join(textParts, "\n")
 				msgs = append(msgs, map[string]any{"role": m.Role, "content": content})
@@ -791,12 +1024,153 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 	return openAI
 }
 
+// parseToolArgs 解析工具调用参数 JSON，带容错修复
+func parseToolArgs(raw string) (any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]any{}, nil
+	}
+	// 清理杂散引号前缀：上游流式输出偶发 "" 前缀（如 ""{"file_path":...}）
+	for strings.HasPrefix(raw, `""`) {
+		raw = strings.TrimPrefix(raw, `""`)
+	}
+	raw = strings.TrimSpace(raw)
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err == nil {
+		if v == nil {
+			return map[string]any{}, nil
+		}
+		return v, nil
+	}
+	// 整体被 JSON 字符串包裹（"{\"file_path\": ...}"）时，解包字符串后再解析
+	if strings.HasPrefix(raw, `"`) && strings.HasSuffix(raw, `"`) && len(raw) >= 2 {
+		var s string
+		if json.Unmarshal([]byte(raw), &s) == nil {
+			var v2 any
+			if json.Unmarshal([]byte(s), &v2) == nil && v2 != nil {
+				return v2, nil
+			}
+		}
+	}
+	fixed := raw
+	if strings.HasPrefix(fixed, "{") && !strings.HasSuffix(fixed, "}") {
+		fixed += "}"
+	} else if strings.HasPrefix(fixed, "[") && !strings.HasSuffix(fixed, "]") {
+		fixed += "]"
+	}
+	if strings.HasSuffix(fixed, ",") {
+		fixed = strings.TrimRight(fixed, ",") + "}"
+	}
+	if err := json.Unmarshal([]byte(fixed), &v); err == nil && v != nil {
+		return v, nil
+	}
+	// 最终兜底：从杂散内容中提取首个 JSON 对象/数组
+	if i := strings.IndexAny(raw, "{["); i >= 0 {
+		openCh := raw[i]
+		closeCh := byte('}')
+		if openCh == '[' {
+			closeCh = ']'
+		}
+		if j := strings.LastIndex(raw, string(closeCh)); j > i {
+			sub := raw[i : j+1]
+			if json.Unmarshal([]byte(sub), &v) == nil && v != nil {
+				return v, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("invalid json: %s", truncate(raw, 120))
+}
+
+// extractToolSchemas 从 Anthropic 请求的 tools 定义中解析每个工具的 input_schema 属性集合，
+// 用于转发 tool_use 时裁剪 input，避免多余字段触发客户端校验失败。
+func extractToolSchemas(tools json.RawMessage) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	if len(tools) == 0 {
+		return out
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(tools, &arr); err != nil {
+		return out
+	}
+	for _, t := range arr {
+		name, _ := t["name"].(string)
+		if name == "" {
+			continue
+		}
+		schema, _ := t["input_schema"].(map[string]any)
+		props, _ := schema["properties"].(map[string]any)
+		var propNames []string
+		for k := range props {
+			propNames = append(propNames, k)
+		}
+		var required []string
+		if req, ok := schema["required"].([]any); ok {
+			for _, r := range req {
+				if s, ok := r.(string); ok {
+					required = append(required, s)
+				}
+			}
+		}
+		log.Printf("  tool schema: name=%s properties=%v required=%v", name, propNames, required)
+		if len(props) == 0 {
+			continue
+		}
+		allowed := map[string]bool{}
+		for k := range props {
+			allowed[k] = true
+		}
+		out[name] = allowed
+	}
+	return out
+}
+
+// filterToolInput 将工具参数裁剪到客户端 schema 允许的字段内；
+// 找不到 schema 或过滤后为空时保留原参数，避免丢参数。
+func filterToolInput(name string, input map[string]any, schemas map[string]map[string]bool) map[string]any {
+	allowed, ok := schemas[name]
+	if !ok || len(allowed) == 0 {
+		return input
+	}
+	out := map[string]any{}
+	for k, v := range input {
+		if allowed[k] {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return input
+	}
+	return out
+}
+
+// anthropicContentToString 将 Anthropic content（字符串或块数组）转为纯文本
+func anthropicContentToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if arr, ok := v.([]any); ok {
+		parts := []string{}
+		for _, it := range arr {
+			if b, ok := it.(map[string]any); ok {
+				if t, ok := b["text"].(string); ok {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 func openAIToAnthropic(openAI map[string]any) map[string]any {
 	out := map[string]any{
-		"id":      "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-		"type":    "message",
-		"role":    "assistant",
-		"model":   getNested(openAI, "model"),
+		"id":    "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+		"type":  "message",
+		"role":  "assistant",
+		"model": getNested(openAI, "model"),
 	}
 
 	choices := getNested(openAI, "choices")
@@ -807,13 +1181,18 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 		return out
 	}
 
-	choice0 := getNested(openAI, "choices", 0).(map[string]any)
+	text := ""
+	choice0, ok := getNested(openAI, "choices", 0).(map[string]any)
+	if !ok {
+		out["content"] = []any{map[string]any{"type": "text", "text": text}}
+		out["stop_reason"] = "end_turn"
+		out["usage"] = map[string]any{"input_tokens": 0, "output_tokens": 0}
+		return out
+	}
 	msg, _ := choice0["message"].(map[string]any)
 	if msg == nil {
 		msg, _ = choice0["delta"].(map[string]any)
 	}
-
-	text := ""
 	if msg != nil {
 		if c, ok := msg["content"].(string); ok {
 			text = sanitizeContent(c)
@@ -825,13 +1204,16 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 	// Convert tool_calls to Anthropic tool_use blocks
 	if msg != nil {
 		if tc, ok := msg["tool_calls"].([]any); ok && len(tc) > 0 {
-			contentBlocks = []any{} // Clear text-only, proper response has both
+			contentBlocks = []any{}
 			if text != "" {
 				contentBlocks = append(contentBlocks, map[string]any{"type": "text", "text": text})
 			}
 			for _, tcItem := range tc {
 				if tcMap, ok := tcItem.(map[string]any); ok {
 					funcData, _ := tcMap["function"].(map[string]any)
+					if funcData == nil {
+						continue
+					}
 					input := funcData["arguments"]
 					// OpenAI arguments is a JSON string; Anthropic expects an object
 					if argsStr, ok := input.(string); ok {
@@ -840,10 +1222,21 @@ func openAIToAnthropic(openAI map[string]any) map[string]any {
 							input = argsObj
 						}
 					}
+					if input == nil {
+						input = map[string]any{}
+					}
+					id, _ := tcMap["id"].(string)
+					if id == "" {
+						id = fmt.Sprintf("toolu_%x_%d", time.Now().UnixMilli(), len(contentBlocks))
+					}
+					name, _ := funcData["name"].(string)
+					if name == "" {
+						continue
+					}
 					block := map[string]any{
 						"type":  "tool_use",
-						"id":    tcMap["id"],
-						"name":  funcData["name"],
+						"id":    id,
+						"name":  name,
 						"input": input,
 					}
 					contentBlocks = append(contentBlocks, block)
@@ -899,6 +1292,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 			"error": map[string]string{"message": "messages is required", "type": "parse_error"},
 		})
 		return
+	}
+
+	toolSchemas := extractToolSchemas(req.Tools)
+	if len(toolSchemas) > 0 {
+		log.Printf("  anthropic tools: %d schemas", len(toolSchemas))
 	}
 
 	if req.MaxTokens == 0 {
@@ -962,7 +1360,13 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, ctx, err := callClineAPI(openAIReq, req.Stream)
+	upstreamStream := req.Stream
+	if !req.Stream && modelNeedsStream(normalizeRequestModel(req.Model)) {
+		upstreamStream = true
+		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
+	}
+
+	resp, ctx, err := callClineAPI(openAIReq, upstreamStream)
 	ctx.apiFormat = "anthropic"
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
@@ -975,21 +1379,17 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if req.Stream {
-		handleAnthropicStream(w, resp, ctx)
-	} else {
-		var raw map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-			insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
+		handleAnthropicStream(w, resp, ctx, normalizeRequestModel(req.Model), toolSchemas)
+		return
+	}
+
+	if upstreamStream {
+		out, err := collectStreamResponse(resp)
+		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
 			return
-		}
-		out := raw
-		if data, ok := raw["data"]; ok {
-			if d, ok := data.(map[string]any); ok {
-				out = d
-			}
 		}
 		out = normalizeOpenAIResponse(out)
 
@@ -999,18 +1399,43 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		anthropicResp := openAIToAnthropic(out)
-
 		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
-			anthropicResp["content"] = []any{}
 			anthropicResp["stop_reason"] = "tool_use"
 		}
-
 		writeJSON(w, http.StatusOK, anthropicResp)
 		insertRequestRecord(ctx, u, true, 200, "")
+		return
 	}
+
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+		})
+		return
+	}
+	out := raw
+	if data, ok := raw["data"]; ok {
+		if d, ok := data.(map[string]any); ok {
+			out = d
+		}
+	}
+	out = normalizeOpenAIResponse(out)
+	anthropicResp := openAIToAnthropic(out)
+
+	if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+		anthropicResp["stop_reason"] = "tool_use"
+	}
+
+	var u2 tokenUsage
+	if usage, ok := out["usage"].(map[string]any); ok {
+		extractOpenAIUsage(usage, &u2)
+	}
+	writeJSON(w, http.StatusOK, anthropicResp)
+	insertRequestRecord(ctx, u2, true, 200, "")
 }
 
-func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
+func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, modelName string, toolSchemas map[string]map[string]bool) {
 	log.Printf("  anthropic stream: starting real-time forward")
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1024,11 +1449,23 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	}
 
 	var u tokenUsage
+	var streamLog *os.File
+	if sf, err := os.OpenFile(resolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		streamLog = sf
+	}
+	defer func() {
+		if streamLog != nil {
+			streamLog.Close()
+		}
+	}()
 
 	emit := func(event string, data any) {
 		d, _ := json.Marshal(data)
-		w.Write([]byte(fmt.Sprintf("event: %s\n", event)))
-		w.Write([]byte(fmt.Sprintf("data: %s\n\n", string(d))))
+		line := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(d))
+		w.Write([]byte(line))
+		if streamLog != nil {
+			streamLog.WriteString(line)
+		}
 		flusher.Flush()
 	}
 
@@ -1037,11 +1474,15 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":          msgID,
-			"type":        "message",
-			"role":        "assistant",
-			"content":     []any{},
-			"model":       "",
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"content": []any{},
+			"model":   modelName,
+			"usage": map[string]any{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
 			"stop_reason": nil,
 		},
 	})
@@ -1050,49 +1491,72 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	*textIndex = -1
 	hasText := false
 	pendingTools := map[int]*toolAccumulator{}
+	emitIndex := 0
+	nextIndex := func() int {
+		i := emitIndex
+		emitIndex++
+		return i
+	}
 
 	emitToolBlock := func(acc *toolAccumulator) {
 		acc.emitted = true
-		var argsObj any
-		json.Unmarshal([]byte(acc.args), &argsObj)
-		if argsObj == nil {
+		if acc.name == "" {
+			log.Printf("  tool_use missing name, skipping (id=%s)", acc.id)
+			return
+		}
+		idx := nextIndex()
+		id := acc.id
+		if id == "" {
+			id = fmt.Sprintf("toolu_%x_%d", time.Now().UnixMilli(), idx)
+			log.Printf("  tool_use missing id, generated %s", id)
+		}
+		argsObj, err := parseToolArgs(acc.args)
+		if err != nil {
+			log.Printf("  tool args parse failed for %s: %v (raw: %s)", acc.name, err, truncate(acc.args, 300))
 			argsObj = map[string]any{}
 		}
+		if inputMap, ok := argsObj.(map[string]any); ok {
+			argsObj = filterToolInput(acc.name, inputMap, toolSchemas)
+		}
+		parsed, _ := json.Marshal(argsObj)
+		log.Printf("  tool_use emit: name=%s id=%s input=%s", acc.name, id, string(parsed))
 		emit("content_block_start", map[string]any{
 			"type":  "content_block_start",
-			"index": acc.index,
+			"index": idx,
 			"content_block": map[string]any{
 				"type":  "tool_use",
-				"id":    acc.id,
+				"id":    id,
 				"name":  acc.name,
-				"input": argsObj,
+				"input": map[string]any{},
+			},
+		})
+		emit("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": idx,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": string(parsed),
 			},
 		})
 		emit("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
-			"index": acc.index,
+			"index": idx,
 		})
 	}
 
-	reader := bufio.NewReader(upstream.Body)
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
+	processSSELine := func(line string) {
 		line = strings.TrimRight(line, "\r\n")
 		if !strings.HasPrefix(line, "data:") {
-			continue
+			return
 		}
 		payload := strings.TrimSpace(line[5:])
 		if payload == "" || payload == "[DONE]" {
-			continue
+			return
 		}
 
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
-			continue
+			return
 		}
 		if data, ok := obj["data"]; ok {
 			if d, ok := data.(map[string]any); ok {
@@ -1100,12 +1564,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 			}
 		}
 
-		// Detect upstream SSE error
 		if errPayload, ok := obj["error"]; ok {
 			errBody, _ := json.Marshal(errPayload)
 			log.Printf("  upstream SSE error: %s", string(errBody))
 			emit("error", map[string]any{"type": "error", "error": errPayload})
-			break
+			return
 		}
 
 		// 旁路提取上游 OpenAI 格式 usage（必须在 choices 空检查之前，
@@ -1116,11 +1579,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 
 		choices, _ := getNested(obj, "choices").([]any)
 		if len(choices) == 0 {
-			continue
+			return
 		}
 		choice, _ := choices[0].(map[string]any)
 		if choice == nil {
-			continue
+			return
 		}
 
 		delta, ok := choice["delta"].(map[string]any)
@@ -1128,11 +1591,10 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 			delta = choice
 		}
 
-		// Text content delta
 		if c, ok := delta["content"].(string); ok && c != "" {
 			if !hasText {
 				hasText = true
-				*textIndex++
+				*textIndex = nextIndex()
 				emit("content_block_start", map[string]any{
 					"type":  "content_block_start",
 					"index": *textIndex,
@@ -1152,7 +1614,6 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 			})
 		}
 
-		// Tool calls - accumulate and emit when complete
 		if tcRaw, ok := delta["tool_calls"].([]any); ok {
 			for _, tc := range tcRaw {
 				tcMap, _ := tc.(map[string]any)
@@ -1177,15 +1638,15 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 					}
 					if args, ok := fn["arguments"].(string); ok && args != "" {
 						acc.args += args
+					} else if argsRaw, ok := fn["arguments"]; ok && argsRaw != nil {
+						if bts, err := json.Marshal(argsRaw); err == nil {
+							acc.args = string(bts)
+						}
 					}
-				}
-				if acc.id != "" && acc.name != "" && acc.args != "" && !acc.emitted {
-					emitToolBlock(acc)
 				}
 			}
 		}
 
-		// Finish reason
 		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
 			switch fr {
 			case "length":
@@ -1193,6 +1654,18 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 			case "tool_calls":
 				stopReason = "tool_use"
 			}
+		}
+	}
+
+	reader := bufio.NewReader(upstream.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			processSSELine(line)
+		}
+		if err != nil {
+			break
 		}
 	}
 
@@ -1336,4 +1809,97 @@ func freePort(port int) {
 		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){Stop-Process -Id $p.OwningProcess -Force}`, port))
 	_ = cmd.Run()
 	time.Sleep(500 * time.Millisecond)
+}
+
+// parseInferenceCapDuration 从 Cline 429 错误体中解析 "Try again in 17h 59m" 形式的等待时长。
+// 支持 "17h 59m"、"17h"、"59m"、"30s"、"1d 2h 30m" 等组合。
+func parseInferenceCapDuration(body string) time.Duration {
+	// 在错误体中查找 "Try again in ..." 子串
+	idx := strings.Index(body, "Try again in")
+	if idx < 0 {
+		return 0
+	}
+	rest := body[idx+len("Try again in"):]
+	// 截取到下一个引号或换行
+	end := len(rest)
+	if i := strings.IndexAny(rest, "\"\n\r}"); i >= 0 {
+		end = i
+	}
+	segment := strings.TrimSpace(rest[:end])
+	return parseHumanDuration(segment)
+}
+
+// parseHumanDuration 解析 "17h 59m" / "2h" / "59m" / "30s" / "1d 2h" 之类的时长。
+func parseHumanDuration(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	var total time.Duration
+	num := 0
+	valid := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			num = num*10 + int(c-'0')
+			valid = true
+		case c == 'd':
+			total += time.Duration(num) * 24 * time.Hour
+			num, valid = 0, false
+		case c == 'h':
+			total += time.Duration(num) * time.Hour
+			num, valid = 0, false
+		case c == 'm' && i+1 < len(s) && s[i+1] == 's':
+			total += time.Duration(num) * time.Millisecond
+			num, valid = 0, false
+			i++
+		case c == 'm':
+			total += time.Duration(num) * time.Minute
+			num, valid = 0, false
+		case c == 's':
+			total += time.Duration(num) * time.Second
+			num, valid = 0, false
+		case c == ' ':
+			// 分隔符
+		default:
+			// 未知字符，重置
+			num, valid = 0, false
+		}
+	}
+	if total <= 0 {
+		return 0
+	}
+	_ = valid
+	return total
+}
+
+// parseRetryAfter 解析 HTTP Retry-After 头（秒数或 HTTP 日期）。
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	// 尝试秒数
+	if secs, err := parseIntSafe(header); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	// 尝试 HTTP 日期
+	if t, err := http.ParseTime(header); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func parseIntSafe(s string) (int, error) {
+	var n int
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("not a number")
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	return n, nil
 }

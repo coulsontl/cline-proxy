@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,10 +31,10 @@ type oauthSessionState struct {
 }
 
 type apiResponse struct {
-	Success bool        `json:"success"`
-	Data    any         `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Message string      `json:"message,omitempty"`
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
@@ -47,6 +48,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
 	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
 	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
+	mux.HandleFunc("/admin/api/accounts/test", corsHandler(handleAdminAccountTest))
 	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
 	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
 	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
@@ -59,6 +61,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/keys/generate", corsHandler(handleAdminGenerateKey))
 	mux.HandleFunc("/admin/api/keys/delete", corsHandler(handleAdminDeleteKey))
 	mux.HandleFunc("/admin/api/models", corsHandler(handleAdminModels))
+	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
 	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
 	mux.HandleFunc("/admin/api/stats/usage", corsHandler(handleStatsUsage))
@@ -124,9 +127,9 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
-			"accounts":   accounts,
-			"total":      len(accounts),
-			"poolIndex":  loadPool().CurrentIdx,
+			"accounts":  accounts,
+			"total":     len(accounts),
+			"poolIndex": loadPool().CurrentIdx,
 		},
 	})
 }
@@ -555,6 +558,7 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /admin/api/accounts/reset  body: { accountId }
+// 仅重置该账号的今日使用次数，不影响总次数、状态和 Token。
 func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -581,15 +585,215 @@ func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reset status to active and refresh token
-	acc.Status = "active"
-	acc.UsageCount = 0
-	if err := refreshAccountToken(acc); err != nil {
-		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "reset failed: " + err.Error()})
+	resetTodayUsage(acc)
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "本地今日调用统计已重置"})
+}
+
+// POST /admin/api/accounts/test  body: { accountId }
+// 用指定账号发送一个 max_tokens=1 的极小探测请求，验证该账号是否可用。
+// 如果命中 429/INFERENCE_CAP_ERROR，自动标记冷却并返回预计恢复时间。
+func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	if req.AccountID == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "accountId is required"})
 		return
 	}
 
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Account reset"})
+	acc := getAccountByID(req.AccountID)
+	if acc == nil {
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: "account not found"})
+		return
+	}
+
+	result, status := testAccount(acc)
+	reason, _ := result["reason"].(string)
+	log.Printf("Test account %s: status=%s reason=%s", truncateEmail(acc.Email), status, reason)
+
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: status == "active",
+		Message: status,
+		Data:    result,
+	})
+}
+
+// testAccount 对单个账号执行轻量探测请求，返回详细结果与最终状态。
+// 测试按钮是"升级版重置"：无论账号当前是 active/cooldown/expired，
+// 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
+// 返回的 status: active / cooldown / expired / error
+func testAccount(acc *Account) (map[string]any, string) {
+	prevStatus := acc.Status
+	prevCooldownUntil := acc.CooldownUntil
+	_ = prevCooldownUntil
+
+	// 取 token（expired/cooldown 也尝试刷新，测试按钮不因状态直接拒绝）
+	token, err := ensureAccountToken(acc)
+	if err != nil {
+		acc.LastReason = "token refresh failed: " + err.Error()
+		acc.Status = "expired"
+		acc.CooldownUntil = time.Time{}
+		_, _ = statsDBExec(`UPDATE accounts SET status='expired', cooldown_until=0, last_reason=? WHERE account_id=?`,
+			acc.LastReason, acc.AccountID)
+		return map[string]any{
+			"accountId":  acc.AccountID,
+			"email":      acc.Email,
+			"status":     "expired",
+			"reason":     acc.LastReason,
+			"prevStatus": prevStatus,
+		}, "expired"
+	}
+
+	// 构造极小探测请求：max_tokens=1, 单条用户消息。探测请求需与正常代理请求
+	// 使用相同的模型选择、流式策略和任务 ID，否则部分模型会返回空响应。
+	probeModel := getDefaultModel()
+	sessionID := fmt.Sprintf("test_%d", time.Now().UnixMilli())
+	probeBody := map[string]any{
+		"model":            probeModel,
+		"max_tokens":       1,
+		"session_id":       sessionID,
+		"reasoning_effort": defaultReasoningEffort,
+		"messages": []map[string]any{
+			{"role": "user", "content": "ping"},
+		},
+	}
+	if modelNeedsStream(probeModel) {
+		probeBody["stream"] = true
+	}
+	bodyJSON, _ := json.Marshal(probeBody)
+
+	req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	if err != nil {
+		return map[string]any{
+			"accountId": acc.AccountID,
+			"email":     acc.Email,
+			"status":    "error",
+			"reason":    "build request: " + err.Error(),
+		}, "error"
+	}
+	req.Header = clineHeaders(token, sessionID)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		// 网络错误：5 分钟短冷却
+		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
+		return map[string]any{
+			"accountId":     acc.AccountID,
+			"email":         acc.Email,
+			"status":        "cooldown",
+			"reason":        acc.LastReason,
+			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+		}, "cooldown"
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+
+	if resp.StatusCode == 429 {
+		duration := parseInferenceCapDuration(bodyStr)
+		if duration <= 0 {
+			duration = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+		reason := truncate(bodyStr, 500)
+		markAccountCooldown(acc, "429: "+reason, duration)
+		log.Printf("Test hit 429 on %s, cooldown %v", truncateEmail(acc.Email), duration)
+		return map[string]any{
+			"accountId":     acc.AccountID,
+			"email":         acc.Email,
+			"status":        "cooldown",
+			"reason":        acc.LastReason,
+			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
+			"httpStatus":    resp.StatusCode,
+		}, "cooldown"
+	}
+
+	if resp.StatusCode == 401 {
+		acc.Status = "expired"
+		acc.LastReason = "401 unauthorized"
+		acc.CooldownUntil = time.Time{}
+		_, _ = statsDBExec(`UPDATE accounts SET status='expired', cooldown_until=0, last_reason=? WHERE account_id=?`,
+			acc.LastReason, acc.AccountID)
+		return map[string]any{
+			"accountId":  acc.AccountID,
+			"email":      acc.Email,
+			"status":     "expired",
+			"reason":     acc.LastReason,
+			"httpStatus": resp.StatusCode,
+		}, "expired"
+	}
+
+	if resp.StatusCode != 200 {
+		// 其它错误：不强制冷却，按一次失败处理
+		return map[string]any{
+			"accountId":  acc.AccountID,
+			"email":      acc.Email,
+			"status":     "error",
+			"reason":     fmt.Sprintf("API %d: %s", resp.StatusCode, truncate(bodyStr, 300)),
+			"httpStatus": resp.StatusCode,
+		}, "error"
+	}
+
+	// 成功：清除所有异常状态（冷却/过期/原因），并递增使用计数
+	acc.Status = "active"
+	acc.LastReason = ""
+	acc.CooldownUntil = time.Time{}
+	markSuccess(acc)
+	return map[string]any{
+		"accountId":  acc.AccountID,
+		"email":      acc.Email,
+		"status":     "active",
+		"reason":     "ok",
+		"httpStatus": resp.StatusCode,
+		"prevStatus": prevStatus,
+	}, "active"
+}
+
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	days := int(d / (24 * time.Hour))
+	d -= time.Duration(days) * 24 * time.Hour
+	hours := int(d / time.Hour)
+	d -= time.Duration(hours) * time.Hour
+	mins := int(d / time.Minute)
+	d -= time.Duration(mins) * time.Minute
+	secs := int(d / time.Second)
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if mins > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", mins))
+	}
+	if secs > 0 && days == 0 && hours == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", secs))
+	}
+	if len(parts) == 0 {
+		return "0s"
+	}
+	return strings.Join(parts, " ")
 }
 
 // Global proxy config (mutable via API)
@@ -607,15 +811,15 @@ func defaultProxyConfig() *proxyConfigData {
 	return &proxyConfigData{
 		Strategy: "round_robin",
 		Headers: map[string]string{
-			"User-Agent":         "Cline/3.0.47",
+			"User-Agent":         "Cline/3.0.50",
 			"HTTP-Referer":       "https://cline.bot",
 			"X-Title":            "Cline",
 			"X-IS-MULTIROOT":     "false",
 			"X-CLIENT-TYPE":      "cline-sdk",
 			"X-CLIENT-VERSION":   "3.0.47",
 			"X-PLATFORM":         "terminal",
-			"X-PLATFORM-VERSION": "3.0.47",
-			"X-CORE-VERSION":     "0.0.66",
+			"X-PLATFORM-VERSION": "3.0.50",
+			"X-CORE-VERSION":     "0.0.70",
 		},
 	}
 }
@@ -675,21 +879,21 @@ func handleAdminDeleteKey(w http.ResponseWriter, r *http.Request) {
 // GET /admin/api/config
 func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := getProxyConfig()
-	addr := r.Host
-	if addr == "" {
-		addr = "0.0.0.0:3457"
+	address := r.Host
+	if address == "" {
+		address = proxyListenAddress
 	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"address":      addr,
+		"address":      address,
 		"strategy":     cfg.Strategy,
 		"version":      "go-1.1",
 		"poolPath":     statsPath,
-		"defaultModel": defaultModel,
+		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
 	}})
 }
 
-// POST /admin/api/config  body: { strategy?, headers? }
+// POST /admin/api/config  body: { strategy?, headers?, defaultModel? }
 func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -703,8 +907,9 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req struct {
-		Strategy string            `json:"strategy"`
-		Headers  map[string]string `json:"headers"`
+		Strategy     string            `json:"strategy"`
+		Headers      map[string]string `json:"headers"`
+		DefaultModel string            `json:"defaultModel"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
@@ -732,24 +937,55 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		changed = true
 	}
 
+	if req.DefaultModel != "" {
+		initModelsCache()
+		modelsMu.Lock()
+		_, ok := modelsCache[req.DefaultModel]
+		modelsMu.Unlock()
+		if !ok {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "unknown model: " + req.DefaultModel})
+			return
+		}
+		setDefaultModel(req.DefaultModel)
+		changed = true
+	}
+
 	if changed {
 		setProxyConfig(cfg)
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"strategy": cfg.Strategy,
-		"headers":  cfg.Headers,
+		"strategy":     cfg.Strategy,
+		"headers":      cfg.Headers,
+		"defaultModel": defaultModel,
 	}})
 }
 
 // GET /admin/api/models 返回当前上游 free 缓存的可选模型。
 func handleAdminModels(w http.ResponseWriter, r *http.Request) {
-	ids := listFreeModels()
-	models := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		models = append(models, map[string]any{"id": id, "cost": "free", "status": "active"})
+	ensureModelsFresh()
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+		"models":   getFreeModels(),
+		"lastSync": modelsLastSync,
+	}})
+}
+
+// POST /admin/api/models/refresh
+func handleAdminModelsRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
 	}
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{"models": models}})
+	initModelsCache()
+	modelsMu.Lock()
+	syncing := modelsSyncing
+	modelsMu.Unlock()
+	if syncing {
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "sync already running"})
+		return
+	}
+	go syncModelsOnce()
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "model sync started"})
 }
 
 // GET /admin/api/stats

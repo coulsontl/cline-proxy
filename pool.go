@@ -37,13 +37,31 @@ func init() {
 	oldAccountsPath = filepath.Join(filepath.Dir(exe), ".cline-accounts.json")
 }
 
+// resolveDataPath 数据文件路径解析：优先可执行文件目录，其次当前工作目录。
+// go run 运行时编译产物在临时目录，此时应回退到工作目录（项目根）查找数据文件。
+func resolveDataPath(filename string) string {
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), filename))
+	}
+	if pwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(pwd, filename))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	// 都不存在：默认写到当前工作目录（go run 场景），保证数据落盘位置稳定
+	if len(candidates) > 1 {
+		return candidates[1]
+	}
+	return candidates[0]
+}
+
 // AccountPool 仅作为返回容器供遍历/状态统计，不再是持久层。
 // 所有写操作各自走 SQL（accounts / api_keys / proxy_state 表）。
-type AccountPool struct {
-	Accounts   []*Account `json:"accounts"`
-	CurrentIdx int        `json:"currentIdx"`
-	Keys       []string   `json:"keys,omitempty"`
-}
+// 结构体定义见 types.go。
 
 // loadPool 从数据库装载账号池与密钥到内存结构，供遍历与统计。
 // 每次调用都查库（账号数量不大，简单优先于缓存一致性）。
@@ -54,7 +72,8 @@ func loadPool() *AccountPool {
 	}
 
 	rows, err := statsDB.Query(`SELECT account_id, email, refresh_token, access_token,
-		expires_at, status, cooldown_until, fail_count, usage_count, last_used, created_at
+		expires_at, status, cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
+		last_used, created_at, last_reason
 		FROM accounts`)
 	if err != nil {
 		log.Printf("loadPool query accounts: %v", err)
@@ -63,10 +82,10 @@ func loadPool() *AccountPool {
 	defer rows.Close()
 	for rows.Next() {
 		var a Account
-		var lastUsed, createdAt int64
+		var lastUsed, createdAt, cooldownMillis int64
 		if err := rows.Scan(&a.AccountID, &a.Email, &a.RefreshToken, &a.AccessToken,
-			&a.ExpiresAt, &a.Status, &a.CooldownUntil, &a.FailCount, &a.UsageCount,
-			&lastUsed, &createdAt); err != nil {
+			&a.ExpiresAt, &a.Status, &cooldownMillis, &a.FailCount, &a.UsageCount,
+			&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason); err != nil {
 			log.Printf("loadPool scan: %v", err)
 			continue
 		}
@@ -76,9 +95,14 @@ func loadPool() *AccountPool {
 		if createdAt > 0 {
 			a.CreatedAt = time.UnixMilli(createdAt)
 		}
-		// 冷却到期自动恢复为可选（不改库，pickAccount 里统一处理）
-		if a.Status == "cooldown" && a.CooldownUntil > 0 && time.Now().UnixMilli() >= a.CooldownUntil {
+		if cooldownMillis > 0 {
+			a.CooldownUntil = time.UnixMilli(cooldownMillis)
+		}
+		// 冷却到期自动恢复（不改库，pickAccount 里统一写库恢复）
+		if a.Status == "cooldown" && !a.CooldownUntil.IsZero() && time.Now().After(a.CooldownUntil) {
 			a.Status = "active"
+			a.CooldownUntil = time.Time{}
+			a.LastReason = ""
 		}
 		p.Accounts = append(p.Accounts, &a)
 	}
@@ -100,8 +124,23 @@ func loadPool() *AccountPool {
 	return p
 }
 
+// setDefaultModel 更新默认模型（内存全局）。模型需在 free 缓存中存在才生效。
+func setDefaultModel(modelID string) {
+	initModelsCache()
+	modelsMu.Lock()
+	_, ok := modelsCache[modelID]
+	modelsMu.Unlock()
+	if !ok {
+		return
+	}
+	defaultModel = modelID
+}
+
 // savePool 保留为空操作以兼容旧调用点。账户各操作已即时写库，无需全量保存。
 func savePool() {}
+
+// savePoolLocked 保留为空操作以兼容上游旧调用点（本仓库用 SQLite，无需文件持久化）。
+func savePoolLocked() {}
 
 // addAccount 插入一个账号。返回 error 以便调用方据实反馈失败，不再静默吞错。
 func addAccount(acc *Account) error {
@@ -114,18 +153,25 @@ func addAccount(acc *Account) error {
 	if acc.CreatedAt.IsZero() {
 		acc.CreatedAt = time.Now()
 	}
+	cooldown := int64(0)
+	if !acc.CooldownUntil.IsZero() {
+		cooldown = acc.CooldownUntil.UnixMilli()
+	}
 	_, err := statsDB.Exec(`INSERT INTO accounts
 		(account_id, email, refresh_token, access_token, expires_at, status,
-		 cooldown_until, fail_count, usage_count, last_used, created_at)
-		VALUES (?,?,?,?,?,'active',0,0,0,?,?)`,
+		 cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
+		 last_used, created_at, last_reason)
+		VALUES (?,?,?,?,?,'active',?,0,0,0,'',?,?,?)`,
 		acc.AccountID, acc.Email, acc.RefreshToken, acc.AccessToken, acc.ExpiresAt,
-		acc.LastUsed.UnixMilli(), acc.CreatedAt.UnixMilli())
+		cooldown, acc.LastUsed.UnixMilli(), acc.CreatedAt.UnixMilli(), acc.LastReason)
 	if err != nil {
 		return fmt.Errorf("insert account: %w", err)
 	}
 	acc.UsageCount = 0
+	acc.UsageCountToday = 0
+	acc.UsageDate = time.Now().Format("2006-01-02")
 	acc.FailCount = 0
-	acc.CooldownUntil = 0
+	acc.CooldownUntil = time.Time{}
 	return nil
 }
 
@@ -149,13 +195,14 @@ func getAccountByID(accountID string) *Account {
 		return nil
 	}
 	var a Account
-	var lastUsed, createdAt int64
+	var lastUsed, createdAt, cooldownMillis int64
 	err := statsDB.QueryRow(`SELECT account_id, email, refresh_token, access_token,
-		expires_at, status, cooldown_until, fail_count, usage_count, last_used, created_at
+		expires_at, status, cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
+		last_used, created_at, last_reason
 		FROM accounts WHERE account_id=?`, accountID).Scan(
 		&a.AccountID, &a.Email, &a.RefreshToken, &a.AccessToken,
-		&a.ExpiresAt, &a.Status, &a.CooldownUntil, &a.FailCount, &a.UsageCount,
-		&lastUsed, &createdAt)
+		&a.ExpiresAt, &a.Status, &cooldownMillis, &a.FailCount, &a.UsageCount,
+		&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason)
 	if err != nil {
 		return nil
 	}
@@ -164,6 +211,9 @@ func getAccountByID(accountID string) *Account {
 	}
 	if createdAt > 0 {
 		a.CreatedAt = time.UnixMilli(createdAt)
+	}
+	if cooldownMillis > 0 {
+		a.CooldownUntil = time.UnixMilli(cooldownMillis)
 	}
 	return &a
 }
@@ -184,7 +234,7 @@ func refreshAccountToken(acc *Account) error {
 	acc.ExpiresAt = parseExpiry(resp.Data.ExpiresAt) - 60000
 	acc.Status = "active"
 	_, err = statsDB.Exec(`UPDATE accounts SET access_token=?, refresh_token=?, expires_at=?, status='active',
-		fail_count=0, cooldown_until=0 WHERE account_id=?`,
+		fail_count=0, cooldown_until=0, last_reason='' WHERE account_id=?`,
 		acc.AccessToken, acc.RefreshToken, acc.ExpiresAt, acc.AccountID)
 	if err != nil {
 		log.Printf("refreshAccountToken update: %v", err)
@@ -192,15 +242,15 @@ func refreshAccountToken(acc *Account) error {
 	return nil
 }
 
-// pickAccount 按策略选号，冷却到期账号自动恢复可选。
+// pickAccount 按策略选号，冷却到期账号自动恢复。
 func pickAccount() *Account {
 	if statsDB == nil {
 		return nil
 	}
-	now := time.Now().UnixMilli()
-	// 先把已到期的冷却账号恢复为 active
-	_, _ = statsDBExec(`UPDATE accounts SET status='active', fail_count=0, cooldown_until=0
-		WHERE status='cooldown' AND cooldown_until>0 AND ? >= cooldown_until`, now)
+	// 先把已到期的冷却账号恢复为 active（自动写库）
+	now := time.Now()
+	_, _ = statsDBExec(`UPDATE accounts SET status='active', fail_count=0, cooldown_until=0, last_reason=''
+		WHERE status='cooldown' AND cooldown_until>0 AND ? >= cooldown_until`, now.UnixMilli())
 
 	p := loadPool()
 	active := make([]*Account, 0)
@@ -234,32 +284,115 @@ func pickAccount() *Account {
 }
 
 // markCooldown 429 时调用：失败计数递增，按指数退避设定冷却截止时间。
-func markCooldown(acc *Account) {
+// 若上游返回了明确等待时长 duration，则优先使用该时长；否则按 failCount 指数退避。
+func markCooldown(acc *Account, duration time.Duration, reason string) {
 	if statsDB == nil || acc == nil {
 		return
 	}
 	acc.FailCount++
 	sec := calcCooldownSec(acc.FailCount)
-	acc.CooldownUntil = time.Now().Add(time.Duration(sec) * time.Second).UnixMilli()
+	var until time.Time
+	if duration > 0 {
+		until = time.Now().Add(duration)
+	} else {
+		until = time.Now().Add(time.Duration(sec) * time.Second)
+	}
+	acc.CooldownUntil = until
+	acc.LastReason = reason
 	acc.Status = "cooldown"
-	_, _ = statsDB.Exec(`UPDATE accounts SET status='cooldown', fail_count=?, cooldown_until=? WHERE account_id=?`,
-		acc.FailCount, acc.CooldownUntil, acc.AccountID)
-	log.Printf("  account %s cooldown %ds (fail #%d)", truncateEmail(acc.Email), sec, acc.FailCount)
+	_, _ = statsDB.Exec(`UPDATE accounts SET status='cooldown', fail_count=?, cooldown_until=?, last_reason=? WHERE account_id=?`,
+		acc.FailCount, until.UnixMilli(), reason, acc.AccountID)
+	log.Printf("  account %s cooldown until %s (fail #%d)", truncateEmail(acc.Email), until.Format("2006-01-02 15:04:05"), acc.FailCount)
 }
 
-// markSuccess 成功时调用：重置失败计数与冷却。
+// markAccountCooldown 将账号置为冷却状态，并记录预计恢复时间与原因。
+// duration 为冷却时长；duration<=0 时使用默认冷却（18 小时）。
+func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
+	if acc == nil {
+		return
+	}
+	if duration <= 0 {
+		duration = 18 * time.Hour // 默认 18 小时（Cline 免费额度每日重置）
+	}
+	until := time.Now().Add(duration)
+	acc.Status = "cooldown"
+	acc.CooldownUntil = until
+	acc.LastReason = reason
+	if statsDB != nil {
+		_, _ = statsDB.Exec(`UPDATE accounts SET status='cooldown', cooldown_until=?, last_reason=? WHERE account_id=?`,
+			until.UnixMilli(), reason, acc.AccountID)
+	}
+	log.Printf("  account %s cooldown until %s (reason: %s)", truncateEmail(acc.Email), until.Format("2006-01-02 15:04:05"), reason)
+}
+
+// markSuccess 成功时调用：重置失败计数与冷却，递增本地累计/今日调用次数（跨日自动重置）。
 func markSuccess(acc *Account) {
 	if statsDB == nil || acc == nil {
 		return
 	}
+	now := time.Now()
+	today := now.Format("2006-01-02")
 	acc.FailCount = 0
-	acc.CooldownUntil = 0
 	acc.Status = "active"
-	acc.LastUsed = time.Now()
+	acc.LastUsed = now
 	acc.UsageCount++
-	_, _ = statsDB.Exec(`UPDATE accounts SET status='active', fail_count=0, cooldown_until=0,
-		usage_count=usage_count+1, last_used=? WHERE account_id=?`,
-		acc.LastUsed.UnixMilli(), acc.AccountID)
+	if acc.UsageDate != today {
+		acc.UsageDate = today
+		acc.UsageCountToday = 0
+	}
+	acc.UsageCountToday++
+	_, _ = statsDB.Exec(`UPDATE accounts SET status='active', fail_count=0, cooldown_until=0, last_reason='',
+		usage_count=usage_count+1,
+		usage_count_today=CASE WHEN usage_date=? THEN usage_count_today+1 ELSE 1 END,
+		usage_date=?, last_used=? WHERE account_id=?`,
+		today, today, now.UnixMilli(), acc.AccountID)
+}
+
+// resetTodayUsage 仅重置本地今日调用计数，不影响累计调用次数。
+func resetTodayUsage(acc *Account) {
+	if acc == nil {
+		return
+	}
+	acc.UsageCountToday = 0
+	acc.UsageDate = time.Now().Format("2006-01-02")
+	if statsDB != nil {
+		_, _ = statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=? WHERE account_id=?`,
+			acc.UsageDate, acc.AccountID)
+	}
+}
+
+// describePoolStatus 汇总当前账号池状态，用于错误诊断。
+func describePoolStatus() string {
+	p := loadPool()
+	total := len(p.Accounts)
+	if total == 0 {
+		return "pool is empty, use --add-account or admin API to add accounts"
+	}
+
+	active, cooldown, expired := 0, 0, 0
+	var nextRecover *time.Time
+	for _, a := range p.Accounts {
+		switch a.Status {
+		case "active":
+			active++
+		case "cooldown":
+			cooldown++
+			if !a.CooldownUntil.IsZero() {
+				if nextRecover == nil || a.CooldownUntil.Before(*nextRecover) {
+					t := a.CooldownUntil
+					nextRecover = &t
+				}
+			}
+		case "expired":
+			expired++
+		}
+	}
+
+	s := fmt.Sprintf("total=%d active=%d cooldown=%d expired=%d", total, active, cooldown, expired)
+	if cooldown > 0 && nextRecover != nil {
+		s += fmt.Sprintf(", earliest recover at %s", nextRecover.Format("2006-01-02 15:04:05"))
+	}
+	return s
 }
 
 // ensureAccountToken 确保 token 有效，必要时刷新。
@@ -279,14 +412,17 @@ func listAccounts() []*Account {
 	result := make([]*Account, 0, len(p.Accounts))
 	for _, a := range p.Accounts {
 		result = append(result, &Account{
-			AccountID:     a.AccountID,
-			Email:         a.Email,
-			Status:        a.Status,
-			CooldownUntil: a.CooldownUntil,
-			FailCount:     a.FailCount,
-			LastUsed:      a.LastUsed,
-			UsageCount:    a.UsageCount,
-			CreatedAt:     a.CreatedAt,
+			AccountID:       a.AccountID,
+			Email:           a.Email,
+			Status:          a.Status,
+			CooldownUntil:   a.CooldownUntil,
+			LastReason:      a.LastReason,
+			FailCount:       a.FailCount,
+			LastUsed:        a.LastUsed,
+			UsageCount:      a.UsageCount,
+			UsageCountToday: a.UsageCountToday,
+			UsageDate:       a.UsageDate,
+			CreatedAt:       a.CreatedAt,
 		})
 	}
 	return result
@@ -338,13 +474,18 @@ func migrateOldAccounts() {
 	}
 
 	for _, a := range p.Accounts {
+		cooldown := int64(0)
+		if !a.CooldownUntil.IsZero() {
+			cooldown = a.CooldownUntil.UnixMilli()
+		}
 		_, _ = statsDB.Exec(`INSERT INTO accounts
 			(account_id, email, refresh_token, access_token, expires_at, status,
-			 cooldown_until, fail_count, usage_count, last_used, created_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			 cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
+			 last_used, created_at, last_reason)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			a.AccountID, a.Email, a.RefreshToken, a.AccessToken, a.ExpiresAt,
-			a.Status, a.CooldownUntil, 0, a.UsageCount,
-			a.LastUsed.UnixMilli(), a.CreatedAt.UnixMilli())
+			a.Status, cooldown, a.FailCount, a.UsageCount, a.UsageCountToday, a.UsageDate,
+			a.LastUsed.UnixMilli(), a.CreatedAt.UnixMilli(), a.LastReason)
 	}
 	for _, k := range p.Keys {
 		addKey(k)

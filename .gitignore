@@ -1,7 +1,18 @@
-cline-proxy.exe
+# Build output
+dist/
+
+# Compiled binary
 cline-proxy
-.cline-accounts.json
-data/
-*.exe
+cline-proxy.exe
+cline-proxy-*
 cline-proxy.err
 cline-proxy.log
+
+# Go workspace
+*.test
+*.out
+
+# Local data
+.cline-accounts.json
+data/
+override.md

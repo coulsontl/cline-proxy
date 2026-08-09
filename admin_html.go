@@ -7,13 +7,14 @@ const adminHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cline 代理管理面板</title>
 <style>
-:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--badge-green-bg:#0e4429;--badge-yellow-bg:#3d2e00;--badge-red-bg:#3d1117;--danger-bg:var(--bg3);--danger-bg-hover:#3d1117}
-[data-theme="light"]{--bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--border:#d0d7de;--text:#1f2328;--text2:#656d76;--accent:#0969da;--green:#1a7f37;--red:#cf222e;--yellow:#9a6700;--blue:#0969da;--badge-green-bg:#dafbe1;--badge-yellow-bg:#fff8c5;--badge-red-bg:#ffebe9;--danger-bg:#ffebe9;--danger-bg-hover:#ffd4d0}
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--badge-green-bg:#0e4429;--badge-yellow-bg:#3d2e00;--badge-red-bg:#3d1117;--danger-bg:var(--bg3);--danger-bg-hover:#3d1117;--toast-success-bg:#1a7f37;--toast-error-bg:#f85149;--toast-info-bg:#1f6feb;--toast-warning-bg:#d29922}
+[data-theme="light"]{--bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--border:#d0d7de;--text:#1f2328;--text2:#656d76;--accent:#0969da;--green:#1a7f37;--red:#cf222e;--yellow:#9a6700;--blue:#0969da;--badge-green-bg:#dafbe1;--badge-yellow-bg:#fff8c5;--badge-red-bg:#ffebe9;--danger-bg:#ffebe9;--danger-bg-hover:#ffd4d0;--toast-success-bg:#1a7f37;--toast-error-bg:#cf222e;--toast-info-bg:#1f6feb;--toast-warning-bg:#9a6700}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
 .layout{display:flex;min-height:100vh}
 .sidebar{width:240px;background:var(--bg2);border-right:1px solid var(--border);padding:16px 0;flex-shrink:0;display:flex;flex-direction:column}
 .sidebar h1{font-size:16px;padding:0 16px 16px;border-bottom:1px solid var(--border);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.sidebar h1 .theme-toggle{margin-left:auto;padding:3px 8px}
 .sidebar h1 span{color:var(--accent)}
 .nav-item{display:flex;align-items:center;gap:10px;padding:8px 16px;cursor:pointer;color:var(--text2);transition:0.15s;border-left:2px solid transparent}
 .nav-item:hover{color:var(--text);background:var(--bg3)}
@@ -66,9 +67,10 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 .form-actions{display:flex;gap:8px;margin-top:12px}
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;z-index:9999;opacity:0;transform:translateY(-10px);transition:0.3s;font-size:13px;max-width:400px}
 .toast.show{opacity:1;transform:translateY(0)}
-.toast.success{background:#1a7f37}
-.toast.error{background:var(--red)}
-.toast.info{background:#1f6feb}
+.toast.success{background:var(--toast-success-bg)}
+.toast.error{background:var(--toast-error-bg)}
+.toast.info{background:var(--toast-info-bg)}
+.toast.warning{background:var(--toast-warning-bg)}
 .loading{display:inline-block;width:14px;height:14px;border:2px solid var(--text2);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .empty{padding:32px;text-align:center;color:var(--text2)}
@@ -88,6 +90,11 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
 .model-tag.free{border:1px solid var(--green);color:var(--green)}
 .model-tag.pass{border:1px solid var(--yellow);color:var(--yellow)}
 .justify-between{display:flex;justify-content:space-between;align-items:center}
+.theme-toggle{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg3);color:var(--text2);cursor:pointer;font-size:12px;transition:0.15s}
+.theme-toggle:hover{color:var(--text);background:var(--border)}
+.theme-toggle .icon{font-size:14px}
+[data-theme="dark"] .theme-toggle .light-label{display:none}
+:root:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </style>
 </head>
 <body>
@@ -145,11 +152,14 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
     <button class="btn btn-sm" onclick="loadAccounts()">🔄 刷新</button>
   </div>
 </div>
+<div style="margin:-6px 0 14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);color:var(--text2);font-size:12px">
+  ℹ️ 次数为<strong style="color:var(--text)">本代理本地统计</strong>：记录该账号成功转发到 Cline 上游的调用次数，不是 Cline 官方免费额度；官方额度以 Cline 上游返回的限制和恢复时间为准。
+</div>
 <div class="section">
   <div class="section-body" style="padding:0">
     <table>
       <thead>
-        <tr><th>邮箱</th><th>状态</th><th>使用次数</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
+        <tr><th>邮箱</th><th>状态</th><th title="本代理本地统计，不代表官方免费额度">本地今日/累计调用</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
       </thead>
       <tbody id="accountTableBody">
         <tr><td colspan="6" class="empty">加载中...</td></tr>
@@ -280,13 +290,29 @@ textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code','Fira Code'
   </div>
 </div>
 
+<div class="section">
+  <div class="section-title">🧠 可用模型 <span id="modelsProbeInfo" style="font-size:12px;font-weight:normal;color:var(--text2)"></span></div>
+  <div class="section-body">
+    <div style="margin-bottom:10px">
+      <button class="btn btn-sm btn-primary" onclick="refreshModels()">🔄 刷新模型</button>
+      <span style="font-size:12px;color:var(--text2)">自动同步上游官方免费模型（60 秒），仅显示不消耗额度的模型</span>
+    </div>
+    <div id="modelsList">加载中...</div>
+  </div>
+</div>
 
 <div class="section">
   <div class="section-title">🔧 代理配置</div>
   <div class="section-body">
     <div class="form-row">
       <div class="field"><label>监听地址</label><input type="text" id="settingAddr" disabled></div>
-      <div class="field"><label>默认模型</label><input type="text" id="settingDefModel" disabled></div>
+      <div class="field">
+        <label>默认模型</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <select id="settingDefModel" style="flex:1;font-family:monospace"></select>
+          <button class="btn btn-sm btn-primary" onclick="saveDefaultModel()">💾 保存</button>
+        </div>
+      </div>
     </div>
     <div class="form-row">
       <div class="field">
@@ -357,12 +383,15 @@ const API = '/admin/api';
 
 const _ = id => document.getElementById(id);
 const esc = s => { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; };
+if (window.location.host) _('footerApiAddr').textContent = 'http://' + window.location.host;
 
-function toast(msg, t) {
+function toast(msg, t, duration) {
   const el = _('toast');
   el.textContent = msg;
-  el.className = 'toast ' + t + ' show';
-  setTimeout(() => el.classList.remove('show'), 3500);
+  el.style.whiteSpace = 'pre-line';
+  el.className = 'toast ' + (t || 'info') + ' show';
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), duration || 3500);
 }
 
 // ========== 主题切换 ==========
@@ -371,7 +400,7 @@ function applyTheme(t) {
   const btn = _('themeToggle');
   if (btn) btn.textContent = t === 'light' ? '☀️' : '🌙';
 }
-applyTheme(localStorage.getItem('theme') || 'light');
+applyTheme(localStorage.getItem('theme') || 'dark');
 function toggleTheme() {
   const cur = document.documentElement.getAttribute('data-theme') || 'dark';
   const next = cur === 'dark' ? 'light' : 'dark';
@@ -454,18 +483,50 @@ async function loadAccounts() {
     tbody.innerHTML = list.map(a => {
       const lu = a.lastUsed ? new Date(a.lastUsed).toLocaleString('zh-CN') : '-';
       const cr = a.createdAt ? new Date(a.createdAt).toLocaleString('zh-CN') : '-';
+      // 冷却标签：展示预计恢复时间
+      let statusExtra = '';
+      if (a.status === 'cooldown') {
+        const until = a.cooldownUntil ? new Date(a.cooldownUntil).toLocaleString('zh-CN') : '';
+        statusExtra = until ? '<div style="font-size:10px;color:var(--text2);margin-top:2px">预计 ' + esc(until) + ' 恢复</div>' : '';
+      }
       return '<tr>' +
         '<td>' + esc(a.email) + '</td>' +
-        '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span></td>' +
-        '<td>' + (a.usageCount || 0) + '</td>' +
+        '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
+          '<td title="本代理本地成功转发次数，不代表官方免费额度">' + (a.usageCountToday || 0) + ' / ' + (a.usageCount || 0) + '</td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
-          '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\')" title="重置">↻</button> ' +
+          '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\', this)" title="测试账号是否可用（成功会清除冷却/过期状态）">⚡</button> ' +
+          '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\')" title="重置本地今日统计">↻</button> ' +
           '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
         '</td></tr>';
     }).join('');
   } catch (e) { toast('加载账号失败: ' + e.message, 'error'); }
+}
+
+async function testAccount(id, btn) {
+  const original = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span>测试中'; }
+  try {
+    const d = await api('POST', '/accounts/test', { accountId: id });
+    const r = d.data || {};
+    const statusMap = { active: '可用', cooldown: '冷却', expired: '已失效', error: '错误' };
+    const label = statusMap[r.status] || r.status;
+    const prevMap = { active: '活跃', cooldown: '冷却', expired: '已过期', '': '' };
+    let msg = '账号 ' + esc(r.email || '') + ' — ' + label;
+    if (r.prevStatus && r.prevStatus !== r.status) msg += '（原状态: ' + (prevMap[r.prevStatus] || r.prevStatus) + '）';
+    if (r.cooldownUntil) msg += '\n预计恢复: ' + esc(r.cooldownUntil);
+    if (r.remaining) msg += '（剩余 ' + esc(r.remaining) + '）';
+    if (r.reason) msg += '\n原因: ' + esc(r.reason);
+    if (r.httpStatus) msg += '\nHTTP: ' + r.httpStatus;
+    const type = r.status === 'active' ? 'success' : (r.status === 'cooldown' ? 'warning' : 'error');
+    toast(msg, type, 6000);
+    loadAccounts(); loadStats();
+  } catch (e) {
+    toast('测试失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = original; }
+  }
 }
 
 async function deleteAccount(id) {
@@ -478,10 +539,10 @@ async function deleteAccount(id) {
 }
 
 async function resetAccount(id) {
-  if (!confirm('确定重置此账号？将清除使用计数并刷新 Token。')) return;
+  if (!confirm('确定重置此账号的本地今日调用统计？不影响累计调用、状态和 Token。')) return;
   try {
-    await api('POST', '/accounts/reset', { accountId: id });
-    toast('账号已重置', 'success');
+    const d = await api('POST', '/accounts/reset', { accountId: id });
+    toast(d.message || '本地今日调用统计已重置', 'success');
     loadAccounts(); loadStats();
   } catch (e) { toast('重置失败: ' + e.message, 'error'); }
 }
@@ -698,7 +759,73 @@ async function saveHeaders() {
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
-// ========== 模型列表 ==========
+const MODEL_STYLE = {
+  active:  { label: '可用', css: 'color:var(--green);border:1px solid var(--green)' },
+  empty:   { label: '响应为空', css: 'color:var(--yellow);border:1px solid var(--yellow)' },
+  pass:    { label: '需订阅', css: 'color:var(--yellow);border:1px solid var(--yellow)' },
+  removed: { label: '已下架', css: 'color:var(--text2);border:1px solid var(--text2)' },
+  error:   { label: '异常', css: 'color:var(--red);border:1px solid var(--red)' },
+  unknown: { label: '未探测', css: 'color:var(--text2);border:1px dashed var(--text2)' }
+};
+const COST_LABEL = { free: '免费', pass: '订阅', quota: '消耗额度' };
+
+async function loadModels() {
+  try {
+    const d = await api('GET', '/models');
+    const models = d.data.models || [];
+    let info = '';
+    if (d.data.lastSync) info += '· 官方清单: ' + new Date(d.data.lastSync).toLocaleTimeString('zh-CN');
+    _('modelsProbeInfo').textContent = info;
+    if (!models.length) { _('modelsList').innerHTML = '<div class="empty">暂无模型</div>'; return; }
+    _('modelsList').innerHTML = models.map(m => {
+      const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
+      const cost = COST_LABEL[m.cost] || m.cost || '';
+      const synced = m.syncedAt ? new Date(m.syncedAt).toLocaleTimeString('zh-CN') : '-';
+      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;margin:4px 0;background:var(--bg3);border-radius:6px">' +
+        '<span style="font-family:monospace;font-size:13px;flex:1">' + esc(m.id) + '</span>' +
+        (m.cost === 'free' ? '<span style="font-size:11px;color:var(--green)">不扣费</span>' : '') +
+        (cost ? '<span class="model-tag">' + esc(cost) + '</span>' : '') +
+        '<span class="model-tag" style="' + st.css + '">' + st.label + '</span>' +
+        '<span style="font-size:11px;color:var(--text2);min-width:60px;text-align:right">' + synced + '</span>' +
+        '</div>';
+    }).join('');
+  } catch (e) { _('modelsList').textContent = '加载失败'; }
+}
+
+async function refreshModels() {
+  try {
+    _('modelsProbeInfo').textContent = '· 同步中...';
+    const d = await api('POST', '/models/refresh');
+    toast(d.message || '同步已开始', 'info');
+    setTimeout(loadModels, 3000);
+  } catch (e) { toast('刷新失败: ' + e.message, 'error'); _('modelsProbeInfo').textContent = ''; }
+}
+
+async function loadModelOptions() {
+  try {
+    const d = await api('GET', '/models');
+    const models = d.data.models || [];
+    const sel = _('settingDefModel');
+    if (!sel) return;
+    sel.innerHTML = models.map(m => {
+      const st = MODEL_STYLE[m.status] || MODEL_STYLE.unknown;
+      return '<option value="' + esc(m.id) + '">' + esc(m.id) + ' (' + st.label + ')</option>';
+    }).join('');
+    const c = await api('GET', '/config');
+    if (c.data.defaultModel) sel.value = c.data.defaultModel;
+    if (!sel.value && models.length) sel.value = models[0].id;
+  } catch (e) { /* ignore */ }
+}
+
+async function saveDefaultModel() {
+  const v = _('settingDefModel').value;
+  if (!v) { toast('请选择模型', 'error'); return; }
+  try {
+    const d = await api('POST', '/config/update', { defaultModel: v });
+    toast('默认模型已保存: ' + d.data.defaultModel, 'success');
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
 // ========== 配置加载 ==========
 async function loadConfig() {
   try {
@@ -708,7 +835,7 @@ async function loadConfig() {
     if (c.strategy) _('settingStrategy').value = c.strategy;
     if (c.version) _('settingVersion').value = c.version;
     if (c.poolPath) _('settingPoolPath').value = c.poolPath;
-    if (c.defaultModel) _('settingDefModel').value = c.defaultModel;
+    loadModelOptions();
     if (c.headers) {
       const tbody = _('headersTableBody');
       tbody.innerHTML = Object.entries(c.headers).map(([k, v]) =>
