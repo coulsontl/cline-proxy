@@ -4,6 +4,7 @@ dist/
 # Compiled binary
 cline-proxy
 cline-proxy.exe
+cline-go-proxy.exe
 cline-proxy-*
 cline-proxy.err
 cline-proxy.log

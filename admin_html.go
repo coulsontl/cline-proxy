@@ -419,7 +419,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); loadModelLimits(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
     if (el.dataset.tab === 'stats') loadStatsPage();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadConfig(); loadOverride(); }
+    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); loadOverride(); }
   });
 });
 
@@ -432,7 +432,7 @@ function switchTab(name) {
   if (name === 'dashboard') { loadStats(); loadAccounts(); loadModelLimits(); }
   if (name === 'accounts') loadAccounts();
   if (name === 'stats') loadStatsPage();
-  if (name === 'settings') { loadKeys(); loadOverride(); }
+  if (name === 'settings') { loadKeys(); loadModels(); loadConfig(); loadOverride(); }
 }
 
 // 导入子标签
@@ -1046,6 +1046,7 @@ if (_('footerApiAddr')) _('footerApiAddr').innerText = window.location.origin;
 loadStats();
 loadAccounts();
 loadKeys();
+loadModels();
 loadConfig();
 loadOverride();
 loadModelLimits();
