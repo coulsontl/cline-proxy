@@ -957,16 +957,19 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"strategy":     cfg.Strategy,
 		"headers":      cfg.Headers,
-		"defaultModel": defaultModel,
+		"defaultModel": getDefaultModel(),
 	}})
 }
 
 // GET /admin/api/models 返回当前上游 free 缓存的可选模型。
 func handleAdminModels(w http.ResponseWriter, r *http.Request) {
 	ensureModelsFresh()
+	modelsMu.Lock()
+	lastSync := modelsLastSync
+	modelsMu.Unlock()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"models":   getFreeModels(),
-		"lastSync": modelsLastSync,
+		"lastSync": lastSync,
 	}})
 }
 

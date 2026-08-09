@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -271,6 +272,7 @@ func startProxy(host string, port int) error {
 		if upstreamStream {
 			out, err := collectStreamResponse(resp)
 			if err != nil {
+				insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, truncate(err.Error(), 2000))
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
@@ -679,24 +681,16 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx
 
 func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 	var (
-		model        string
-		content      strings.Builder
-		finishReason string
-		usage        map[string]any
-		toolCalls    []any
-		toolCallIdx  = -1
-		curToolCall  map[string]any
-		curArgs      strings.Builder
+		model                string
+		content              strings.Builder
+		finishReason         string
+		usage                map[string]any
+		toolCallAccumulators = make(map[int]*toolAccumulator)
 	)
 
 	reader := bufio.NewReader(upstream.Body)
 	for {
 		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF && err != bufio.ErrBufferFull {
-				break
-			}
-		}
 		line = strings.TrimRight(line, "\r\n")
 
 		if strings.HasPrefix(line, "data:") {
@@ -750,37 +744,49 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 					if i, ok := tcMap["index"].(float64); ok {
 						idx = int(i)
 					}
-					if idx != toolCallIdx {
-						if curToolCall != nil {
-							curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
-							toolCalls = append(toolCalls, curToolCall)
-						}
-						curToolCall = map[string]any{
-							"id":       tcMap["id"],
-							"type":     "function",
-							"function": map[string]any{"name": "", "arguments": ""},
-						}
-						curArgs.Reset()
-						toolCallIdx = idx
+					accumulator, exists := toolCallAccumulators[idx]
+					if !exists {
+						accumulator = &toolAccumulator{index: idx}
+						toolCallAccumulators[idx] = accumulator
+					}
+					if id, ok := tcMap["id"].(string); ok && id != "" {
+						accumulator.id = id
 					}
 					if fn, ok := tcMap["function"].(map[string]any); ok {
 						if n, ok := fn["name"].(string); ok && n != "" {
-							curToolCall["function"].(map[string]any)["name"] = n
+							accumulator.name = n
 						}
 						if a, ok := fn["arguments"].(string); ok && a != "" {
-							curArgs.WriteString(a)
+							accumulator.args += a
 						}
 					}
 				}
 			}
 		}
-		if err == io.EOF {
-			break
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("read upstream stream: %w", err)
 		}
 	}
-	if curToolCall != nil {
-		curToolCall["function"].(map[string]any)["arguments"] = curArgs.String()
-		toolCalls = append(toolCalls, curToolCall)
+
+	toolCallIndexes := make([]int, 0, len(toolCallAccumulators))
+	for index := range toolCallAccumulators {
+		toolCallIndexes = append(toolCallIndexes, index)
+	}
+	sort.Ints(toolCallIndexes)
+	toolCalls := make([]any, 0, len(toolCallIndexes))
+	for _, index := range toolCallIndexes {
+		accumulator := toolCallAccumulators[index]
+		toolCalls = append(toolCalls, map[string]any{
+			"id":   accumulator.id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      accumulator.name,
+				"arguments": accumulator.args,
+			},
+		})
 	}
 
 	message := map[string]any{
@@ -1386,6 +1392,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if upstreamStream {
 		out, err := collectStreamResponse(resp)
 		if err != nil {
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})

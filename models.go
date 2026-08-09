@@ -30,10 +30,11 @@ type ModelInfo struct {
 }
 
 var (
-	modelsMu       sync.Mutex
-	modelsCache    map[string]*ModelInfo
-	modelsSyncing  bool
-	modelsLastSync time.Time
+	modelsMu                sync.Mutex
+	modelsCache             map[string]*ModelInfo
+	modelsSyncing           bool
+	modelsLastSync          time.Time
+	freeModelsSyncSucceeded bool
 )
 
 const (
@@ -45,9 +46,9 @@ const recommendedModelsURL = clineAPIBase + "/ai/cline/recommended-models"
 
 func seedModelCandidates() []*ModelInfo {
 	return []*ModelInfo{
-		{ID: "deepseek/deepseek-v4-flash", Source: "free", Provider: "deepseek", Cost: "free", RequiresStream: true},
-		{ID: "poolside/laguna-s-2.1:free", Source: "free", Provider: "poolside", Cost: "free"},
-		{ID: "stepfun/step-3.7-flash", Source: "free", Provider: "stepfun", Cost: "free", RequiresStream: true},
+		{ID: "deepseek/deepseek-v4-flash", Source: "free", Provider: "deepseek", Cost: "free", Status: ModelUnknown, RequiresStream: true},
+		{ID: "poolside/laguna-s-2.1:free", Source: "free", Provider: "poolside", Cost: "free", Status: ModelUnknown},
+		{ID: "stepfun/step-3.7-flash", Source: "free", Provider: "stepfun", Cost: "free", Status: ModelUnknown, RequiresStream: true},
 	}
 }
 
@@ -58,6 +59,7 @@ func initModelsCache() {
 		return
 	}
 	modelsCache = make(map[string]*ModelInfo)
+	freeModelsSyncSucceeded = false
 	for _, m := range seedModelCandidates() {
 		modelsCache[m.ID] = m
 	}
@@ -126,13 +128,19 @@ func syncRecommendedModels() (int, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return 0, err
 	}
+	return applyRecommendedModels(payload), nil
+}
 
+func applyRecommendedModels(payload recommendedPayload) int {
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
 
 	added := 0
+	now := time.Now()
+	seen := make(map[string]bool, len(payload.Free))
 	for _, m := range payload.Free {
 		id := m.ID
+		seen[id] = true
 		provider := id
 		if i := indexByte(id, '/'); i >= 0 {
 			provider = id[:i]
@@ -142,7 +150,7 @@ func syncRecommendedModels() (int, error) {
 			cached.Cost = "free"
 			cached.Provider = provider
 			cached.Status = ModelActive
-			cached.SyncedAt = time.Now()
+			cached.SyncedAt = now
 			if cached.Name == "" {
 				cached.Name = m.Name
 			}
@@ -156,13 +164,19 @@ func syncRecommendedModels() (int, error) {
 			Cost:           "free",
 			Status:         ModelActive,
 			RequiresStream: indexByte(id, ':') < 0,
-			SyncedAt:       time.Now(),
+			SyncedAt:       now,
 		}
 		added++
 	}
 
-	modelsLastSync = time.Now()
-	return added, nil
+	for id, cached := range modelsCache {
+		if !seen[id] {
+			cached.Status = ModelRemoved
+		}
+	}
+	modelsLastSync = now
+	freeModelsSyncSucceeded = true
+	return added
 }
 
 func indexByte(s string, b byte) int {
@@ -234,8 +248,9 @@ func normalizeRequestModel(id string) string {
 }
 
 func apiModelList() []map[string]any {
-	out := make([]map[string]any, 0, len(modelsCache))
-	for _, m := range getFreeModels() {
+	models := getFreeModels()
+	out := make([]map[string]any, 0, len(models))
+	for _, m := range models {
 		out = append(out, map[string]any{
 			"id":             m.ID,
 			"object":         "model",
@@ -284,18 +299,20 @@ func modelIsFree(model string) bool {
 	return m.Status == ModelActive
 }
 
-// freeModelsReady 返回 free 缓存是否已填充（启动早期未就绪时不拦截请求）。
+// freeModelsReady 返回是否至少成功同步过一次官方 free 模型清单。
+// 启动早期或同步失败时保持旧的放行行为。
 func freeModelsReady() bool {
 	initModelsCache()
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
-	return len(modelsCache) > 0
+	return freeModelsSyncSucceeded
 }
 
 // listFreeModels 返回当前 free 缓存的模型 id 列表，供 admin 与模型限制页展示。
 func listFreeModels() []string {
-	out := make([]string, 0, len(modelsCache))
-	for _, m := range getFreeModels() {
+	models := getFreeModels()
+	out := make([]string, 0, len(models))
+	for _, m := range models {
 		out = append(out, m.ID)
 	}
 	return out

@@ -106,6 +106,17 @@ func loadPool() *AccountPool {
 		}
 		p.Accounts = append(p.Accounts, &a)
 	}
+	today := time.Now().Format("2006-01-02")
+	for _, account := range p.Accounts {
+		if account.UsageDate != today {
+			account.UsageCountToday = 0
+			account.UsageDate = today
+			if _, err := statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=? WHERE account_id=?`,
+				today, account.AccountID); err != nil {
+				log.Printf("loadPool reset daily usage: %v", err)
+			}
+		}
+	}
 
 	keyRows, err := statsDB.Query(`SELECT key FROM api_keys ORDER BY created_at`)
 	if err != nil {
@@ -128,8 +139,8 @@ func loadPool() *AccountPool {
 func setDefaultModel(modelID string) {
 	initModelsCache()
 	modelsMu.Lock()
+	defer modelsMu.Unlock()
 	_, ok := modelsCache[modelID]
-	modelsMu.Unlock()
 	if !ok {
 		return
 	}
@@ -214,6 +225,15 @@ func getAccountByID(accountID string) *Account {
 	}
 	if cooldownMillis > 0 {
 		a.CooldownUntil = time.UnixMilli(cooldownMillis)
+	}
+	today := time.Now().Format("2006-01-02")
+	if a.UsageDate != today {
+		a.UsageCountToday = 0
+		a.UsageDate = today
+		if _, err := statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=? WHERE account_id=?`,
+			today, a.AccountID); err != nil {
+			log.Printf("getAccountByID reset daily usage: %v", err)
+		}
 	}
 	return &a
 }
@@ -449,6 +469,54 @@ func removeKey(key string) bool {
 
 // ---- 自动迁移旧 JSON ----
 
+type legacyAccountPool struct {
+	Accounts   []*legacyAccount `json:"accounts"`
+	CurrentIdx int              `json:"currentIdx"`
+	Keys       []string         `json:"keys,omitempty"`
+}
+
+type legacyAccount struct {
+	AccountID       string          `json:"accountId"`
+	Email           string          `json:"email"`
+	RefreshToken    string          `json:"refreshToken"`
+	Status          string          `json:"status"`
+	LastUsed        time.Time       `json:"lastUsed"`
+	UsageCount      int64           `json:"usageCount"`
+	UsageCountToday int64           `json:"usageCountToday"`
+	UsageDate       string          `json:"usageDate"`
+	CreatedAt       time.Time       `json:"createdAt"`
+	CooldownUntil   json.RawMessage `json:"cooldownUntil"`
+	LastReason      string          `json:"lastReason"`
+	FailCount       int             `json:"failCount"`
+}
+
+func parseLegacyCooldownUntil(raw json.RawMessage) (time.Time, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return time.Time{}, nil
+	}
+
+	var milliseconds int64
+	if err := json.Unmarshal(raw, &milliseconds); err == nil {
+		if milliseconds <= 0 {
+			return time.Time{}, nil
+		}
+		return time.UnixMilli(milliseconds), nil
+	}
+
+	var timestamp string
+	if err := json.Unmarshal(raw, &timestamp); err != nil {
+		return time.Time{}, fmt.Errorf("unsupported cooldownUntil value: %s", string(raw))
+	}
+	if timestamp == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse cooldownUntil: %w", err)
+	}
+	return parsed, nil
+}
+
 // migrateOldAccounts 启动时若库中无账号且存在旧 JSON，导入一次（保留旧文件作备份）。
 func migrateOldAccounts() {
 	if statsDB == nil {
@@ -464,7 +532,7 @@ func migrateOldAccounts() {
 	if err != nil {
 		return // 无旧文件，正常
 	}
-	var p AccountPool
+	var p legacyAccountPool
 	if err := json.Unmarshal(data, &p); err != nil {
 		log.Printf("migrate: parse old JSON failed: %v", err)
 		return
@@ -473,18 +541,26 @@ func migrateOldAccounts() {
 		return
 	}
 
-	for _, a := range p.Accounts {
-		cooldown := int64(0)
-		if !a.CooldownUntil.IsZero() {
-			cooldown = a.CooldownUntil.UnixMilli()
+	cooldownMillisByAccount := make([]int64, len(p.Accounts))
+	for index, account := range p.Accounts {
+		cooldownUntil, err := parseLegacyCooldownUntil(account.CooldownUntil)
+		if err != nil {
+			log.Printf("migrate: parse cooldownUntil for account %s failed: %v", account.AccountID, err)
+			return
 		}
+		if !cooldownUntil.IsZero() {
+			cooldownMillisByAccount[index] = cooldownUntil.UnixMilli()
+		}
+	}
+
+	for index, a := range p.Accounts {
 		_, _ = statsDB.Exec(`INSERT INTO accounts
 			(account_id, email, refresh_token, access_token, expires_at, status,
 			 cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
 			 last_used, created_at, last_reason)
 			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			a.AccountID, a.Email, a.RefreshToken, a.AccessToken, a.ExpiresAt,
-			a.Status, cooldown, a.FailCount, a.UsageCount, a.UsageCountToday, a.UsageDate,
+			a.AccountID, a.Email, a.RefreshToken, "", int64(0),
+			a.Status, cooldownMillisByAccount[index], a.FailCount, a.UsageCount, a.UsageCountToday, a.UsageDate,
 			a.LastUsed.UnixMilli(), a.CreatedAt.UnixMilli(), a.LastReason)
 	}
 	for _, k := range p.Keys {
