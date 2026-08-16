@@ -378,12 +378,16 @@ func clearStats(beforeDays int) (int64, error) {
 	return n, nil
 }
 
-// daysCutoff 返回 N 天前的截止时间，days<=0 时默认 7。
+// daysCutoff 返回统计窗口起点：包含今天在内的 days 个自然日的 0 点。
+// 与账号管理"今日=自然日 0 点起"口径一致（days=1 即今天 0 点）；
+// days<=0 时默认 7。
 func daysCutoff(days int) time.Time {
 	if days <= 0 {
 		days = 7
 	}
-	return time.Now().AddDate(0, 0, -days)
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return today.AddDate(0, 0, -(days - 1))
 }
 
 // atoiDefault 解析查询参数，失败或非正返回默认值。
