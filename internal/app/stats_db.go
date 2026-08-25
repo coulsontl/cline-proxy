@@ -1,6 +1,7 @@
-package main
+package app
 
 import (
+	"cline-go-proxy/internal/kit"
 	"database/sql"
 	"fmt"
 	"log"
@@ -46,9 +47,9 @@ type tokenUsage struct {
 	totalTokens      int
 }
 
-// initStats 初始化统计数据库。失败只返回 error，由调用方决定是否降级（不应 fatal）。
+// InitStats 初始化统计数据库。失败只返回 error，由调用方决定是否降级（不应 fatal）。
 // 幂等：已初始化则直接返回。
-func initStats() error {
+func InitStats() error {
 	if statsDB != nil {
 		return nil
 	}
@@ -83,7 +84,10 @@ func initStats() error {
   usage_date        TEXT    NOT NULL DEFAULT '',
   last_reason       TEXT    NOT NULL DEFAULT '',
   last_used         INTEGER NOT NULL DEFAULT 0,
-  created_at        INTEGER NOT NULL DEFAULT 0
+  created_at        INTEGER NOT NULL DEFAULT 0,
+  tokens_total      INTEGER NOT NULL DEFAULT 0,
+  tokens_today      INTEGER NOT NULL DEFAULT 0,
+  tokens_date       TEXT    NOT NULL DEFAULT ''
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_acc_status ON accounts(status)`,
 		// API 密钥
@@ -135,6 +139,9 @@ func initStats() error {
 		`ALTER TABLE accounts ADD COLUMN usage_count_today INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN usage_date TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN last_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN tokens_total INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN tokens_today INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN tokens_date TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, s := range migrateStmts {
 		if _, err := d.Exec(s); err != nil {
@@ -171,7 +178,7 @@ func insertRequestRecord(ctx *requestContext, u tokenUsage, success bool, status
 		ctx.apiFormat, email, ctx.model, boolToInt(ctx.isStream),
 		boolToInt(success), statusCode,
 		u.promptTokens, u.completionTokens, u.totalTokens,
-		truncate(errMsg, 2000), dur,
+		kit.Truncate(errMsg, 2000), dur,
 	)
 }
 

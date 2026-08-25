@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cline-go-proxy/internal/app"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +13,6 @@ import (
 
 func main() {
 	loginMode := flag.Bool("login", false, "Run OAuth device login flow and add account to pool")
-	captureMode := flag.Bool("capture", false, "Run interactive OAuth capture (records ALL traffic)")
 	host := flag.String("host", "0.0.0.0", "Listen host (default 0.0.0.0 allows LAN access; 127.0.0.1 for local only)")
 	port := flag.Int("port", 3457, "Proxy server port")
 	addAccount := flag.Bool("add-account", false, "Add a new account via OAuth to the pool")
@@ -22,25 +22,18 @@ func main() {
 
 	// 初始化统计/账号数据库（login/list 等模式也需要）。
 	// 失败只警告不 fatal，但 login 等写入账号的模式会因 statsDB==nil 而失败。
-	if err := initStats(); err != nil {
+	if err := app.InitStats(); err != nil {
 		log.Printf("WARNING: stats db init failed: %v (database features disabled)", err)
 	}
-	migrateOldAccounts()
+	app.MigrateOldAccounts()
 
 	if *startMode {
 		buildAndStart(*host, *port)
 		return
 	}
 
-	if *captureMode {
-		if err := doFullCapture(); err != nil {
-			log.Fatalf("Capture failed: %v", err)
-		}
-		return
-	}
-
 	if *loginMode || *addAccount {
-		acc, err := addAccountFromDeviceAuth()
+		acc, err := app.AddAccountFromDeviceAuth()
 		if err != nil {
 			log.Fatalf("Login failed: %v", err)
 		}
@@ -53,21 +46,21 @@ func main() {
 	}
 
 	if *showList {
-		accounts := listAccounts()
+		accounts := app.ListAccounts()
 		if len(accounts) == 0 {
 			fmt.Println("No accounts in pool. Use --add-account to add one.")
 			return
 		}
 		fmt.Printf("\n=== Account Pool (%d accounts) ===\n\n", len(accounts))
 		for i, a := range accounts {
-			fmt.Printf("  %d. [%s] %s (status: %s, used: %d)\n",
-				i+1, a.AccountID, a.Email, a.Status, a.UsageCount)
+		fmt.Printf("  %d. [%s] %s (status: %s, used: %d, tokens: %d today / %d total)\n",
+			i+1, a.AccountID, a.Email, a.Status, a.UsageCount, a.TokensToday, a.TokensTotal)
 		}
 		fmt.Println()
 		return
 	}
 
-	if err := startProxy(*host, *port); err != nil {
+	if err := app.StartProxy(*host, *port); err != nil {
 		log.Fatalf("Proxy failed: %v", err)
 		os.Exit(1)
 	}

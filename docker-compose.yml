@@ -10,6 +10,6 @@ services:
     volumes:
       # 账号池与统计记录均持久化在 data 目录（SQLite stats.db）
       - ./data:/app/data
-      - ./override.md:/app/override.md
+      - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457

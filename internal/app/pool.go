@@ -1,6 +1,8 @@
-package main
+package app
 
 import (
+	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -35,29 +37,11 @@ var oldAccountsPath string
 func init() {
 	exe, _ := os.Executable()
 	oldAccountsPath = filepath.Join(filepath.Dir(exe), ".cline-accounts.json")
+	_ = kit.ResolveDataPath // 保留 kit 引用（数据路径解析已由 resolveDataPath 统一处理）
 }
 
-// resolveDataPath 数据文件路径解析：优先可执行文件目录，其次当前工作目录。
+// kit.ResolveDataPath 数据文件路径解析：优先可执行文件目录，其次当前工作目录。
 // go run 运行时编译产物在临时目录，此时应回退到工作目录（项目根）查找数据文件。
-func resolveDataPath(filename string) string {
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), filename))
-	}
-	if pwd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(pwd, filename))
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	// 都不存在：默认写到当前工作目录（go run 场景），保证数据落盘位置稳定
-	if len(candidates) > 1 {
-		return candidates[1]
-	}
-	return candidates[0]
-}
 
 // AccountPool 仅作为返回容器供遍历/状态统计，不再是持久层。
 // 所有写操作各自走 SQL（accounts / api_keys / proxy_state 表）。
@@ -73,7 +57,7 @@ func loadPool() *AccountPool {
 
 	rows, err := statsDB.Query(`SELECT account_id, email, refresh_token, access_token,
 		expires_at, status, cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
-		last_used, created_at, last_reason
+		last_used, created_at, last_reason, tokens_total, tokens_today, tokens_date
 		FROM accounts`)
 	if err != nil {
 		log.Printf("loadPool query accounts: %v", err)
@@ -85,7 +69,8 @@ func loadPool() *AccountPool {
 		var lastUsed, createdAt, cooldownMillis int64
 		if err := rows.Scan(&a.AccountID, &a.Email, &a.RefreshToken, &a.AccessToken,
 			&a.ExpiresAt, &a.Status, &cooldownMillis, &a.FailCount, &a.UsageCount,
-			&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason); err != nil {
+			&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason,
+			&a.TokensTotal, &a.TokensToday, &a.TokensDate); err != nil {
 			log.Printf("loadPool scan: %v", err)
 			continue
 		}
@@ -114,6 +99,14 @@ func loadPool() *AccountPool {
 			if _, err := statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=? WHERE account_id=?`,
 				today, account.AccountID); err != nil {
 				log.Printf("loadPool reset daily usage: %v", err)
+			}
+		}
+		if account.TokensDate != today {
+			account.TokensToday = 0
+			account.TokensDate = today
+			if _, err := statsDB.Exec(`UPDATE accounts SET tokens_today=0, tokens_date=? WHERE account_id=?`,
+				today, account.AccountID); err != nil {
+				log.Printf("loadPool reset daily tokens: %v", err)
 			}
 		}
 	}
@@ -171,8 +164,8 @@ func addAccount(acc *Account) error {
 	_, err := statsDB.Exec(`INSERT INTO accounts
 		(account_id, email, refresh_token, access_token, expires_at, status,
 		 cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
-		 last_used, created_at, last_reason)
-		VALUES (?,?,?,?,?,'active',?,0,0,0,'',?,?,?)`,
+		 last_used, created_at, last_reason, tokens_total, tokens_today, tokens_date)
+		VALUES (?,?,?,?,?,'active',?,0,0,0,'',?,?,?,0,0,'')`,
 		acc.AccountID, acc.Email, acc.RefreshToken, acc.AccessToken, acc.ExpiresAt,
 		cooldown, acc.LastUsed.UnixMilli(), acc.CreatedAt.UnixMilli(), acc.LastReason)
 	if err != nil {
@@ -181,6 +174,9 @@ func addAccount(acc *Account) error {
 	acc.UsageCount = 0
 	acc.UsageCountToday = 0
 	acc.UsageDate = time.Now().Format("2006-01-02")
+	acc.TokensTotal = 0
+	acc.TokensToday = 0
+	acc.TokensDate = acc.UsageDate
 	acc.FailCount = 0
 	acc.CooldownUntil = time.Time{}
 	return nil
@@ -209,11 +205,12 @@ func getAccountByID(accountID string) *Account {
 	var lastUsed, createdAt, cooldownMillis int64
 	err := statsDB.QueryRow(`SELECT account_id, email, refresh_token, access_token,
 		expires_at, status, cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
-		last_used, created_at, last_reason
+		last_used, created_at, last_reason, tokens_total, tokens_today, tokens_date
 		FROM accounts WHERE account_id=?`, accountID).Scan(
 		&a.AccountID, &a.Email, &a.RefreshToken, &a.AccessToken,
 		&a.ExpiresAt, &a.Status, &cooldownMillis, &a.FailCount, &a.UsageCount,
-		&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason)
+		&a.UsageCountToday, &a.UsageDate, &lastUsed, &createdAt, &a.LastReason,
+		&a.TokensTotal, &a.TokensToday, &a.TokensDate)
 	if err != nil {
 		return nil
 	}
@@ -235,12 +232,20 @@ func getAccountByID(accountID string) *Account {
 			log.Printf("getAccountByID reset daily usage: %v", err)
 		}
 	}
+	if a.TokensDate != today {
+		a.TokensToday = 0
+		a.TokensDate = today
+		if _, err := statsDB.Exec(`UPDATE accounts SET tokens_today=0, tokens_date=? WHERE account_id=?`,
+			today, a.AccountID); err != nil {
+			log.Printf("getAccountByID reset daily tokens: %v", err)
+		}
+	}
 	return &a
 }
 
 // refreshAccountToken 刷新账号 token 并写库。失败标记 expired。
 func refreshAccountToken(acc *Account) error {
-	resp, err := refreshClineToken(acc.RefreshToken)
+	resp, err := cline.RefreshClineToken(acc.RefreshToken)
 	if err != nil {
 		acc.Status = "expired"
 		_, _ = statsDB.Exec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
@@ -251,7 +256,7 @@ func refreshAccountToken(acc *Account) error {
 	if resp.Data.RefreshToken != "" {
 		acc.RefreshToken = resp.Data.RefreshToken
 	}
-	acc.ExpiresAt = parseExpiry(resp.Data.ExpiresAt) - 60000
+	acc.ExpiresAt = cline.ParseExpiry(resp.Data.ExpiresAt) - 60000
 	acc.Status = "active"
 	_, err = statsDB.Exec(`UPDATE accounts SET access_token=?, refresh_token=?, expires_at=?, status='active',
 		fail_count=0, cooldown_until=0, last_reason='' WHERE account_id=?`,
@@ -325,6 +330,49 @@ func markCooldown(acc *Account, duration time.Duration, reason string) {
 	log.Printf("  account %s cooldown until %s (fail #%d)", truncateEmail(acc.Email), until.Format("2006-01-02 15:04:05"), acc.FailCount)
 }
 
+// ListAccounts 返回脱敏账号列表（不含 token），供 CLI / 管理面板调用。
+func ListAccounts() []*Account {
+	p := loadPool()
+
+	// 自动解除已到期的冷却，确保返回的列表是最新状态
+	usageDate := time.Now().Format("2006-01-02")
+	for _, a := range p.Accounts {
+		if a.Status == "cooldown" && !a.CooldownUntil.IsZero() && time.Now().After(a.CooldownUntil) {
+			a.Status = "active"
+			a.CooldownUntil = time.Time{}
+			a.LastReason = ""
+		}
+		if a.UsageDate != usageDate {
+			a.UsageDate = usageDate
+			a.UsageCountToday = 0
+		}
+		if a.TokensDate != usageDate {
+			a.TokensDate = usageDate
+			a.TokensToday = 0
+		}
+	}
+	result := make([]*Account, len(p.Accounts))
+	for i, a := range p.Accounts {
+		// Don't expose tokens
+		result[i] = &Account{
+			AccountID:       a.AccountID,
+			Email:           a.Email,
+			Status:          a.Status,
+			LastUsed:        a.LastUsed,
+			UsageCount:      a.UsageCount,
+			UsageCountToday: a.UsageCountToday,
+			UsageDate:       a.UsageDate,
+			TokensTotal:     a.TokensTotal,
+			TokensToday:     a.TokensToday,
+			TokensDate:      a.TokensDate,
+			CreatedAt:       a.CreatedAt,
+			CooldownUntil:   a.CooldownUntil,
+			LastReason:      a.LastReason,
+		}
+	}
+	return result
+}
+
 // markAccountCooldown 将账号置为冷却状态，并记录预计恢复时间与原因。
 // duration 为冷却时长；duration<=0 时使用默认冷却（18 小时）。
 func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
@@ -373,12 +421,34 @@ func resetTodayUsage(acc *Account) {
 	if acc == nil {
 		return
 	}
+	today := time.Now().Format("2006-01-02")
 	acc.UsageCountToday = 0
-	acc.UsageDate = time.Now().Format("2006-01-02")
+	acc.UsageDate = today
+	acc.TokensToday = 0
+	acc.TokensDate = today
 	if statsDB != nil {
-		_, _ = statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=? WHERE account_id=?`,
-			acc.UsageDate, acc.AccountID)
+		_, _ = statsDB.Exec(`UPDATE accounts SET usage_count_today=0, usage_date=?, tokens_today=0, tokens_date=? WHERE account_id=?`,
+			today, today, acc.AccountID)
 	}
+}
+
+// recordAccountTokens 记录账号本次请求消耗的 token（prompt+completion），
+// 自动处理跨日重置，累计值不重置。tokens<=0 时忽略。
+func recordAccountTokens(acc *Account, tokens int64) {
+	if acc == nil || tokens <= 0 || statsDB == nil {
+		return
+	}
+	today := time.Now().Format("2006-01-02")
+	if acc.TokensDate != today {
+		acc.TokensDate = today
+		acc.TokensToday = 0
+	}
+	acc.TokensToday += tokens
+	acc.TokensTotal += tokens
+	_, _ = statsDB.Exec(`UPDATE accounts SET
+		tokens_today=CASE WHEN tokens_date=? THEN tokens_today+? ELSE ? END,
+		tokens_total=tokens_total+?, tokens_date=? WHERE account_id=?`,
+		today, tokens, tokens, tokens, today, acc.AccountID)
 }
 
 // describePoolStatus 汇总当前账号池状态，用于错误诊断。
@@ -424,28 +494,6 @@ func ensureAccountToken(acc *Account) (string, error) {
 		return "", err
 	}
 	return acc.AccessToken, nil
-}
-
-// listAccounts 返回脱敏账号列表（不含 token）。
-func listAccounts() []*Account {
-	p := loadPool()
-	result := make([]*Account, 0, len(p.Accounts))
-	for _, a := range p.Accounts {
-		result = append(result, &Account{
-			AccountID:       a.AccountID,
-			Email:           a.Email,
-			Status:          a.Status,
-			CooldownUntil:   a.CooldownUntil,
-			LastReason:      a.LastReason,
-			FailCount:       a.FailCount,
-			LastUsed:        a.LastUsed,
-			UsageCount:      a.UsageCount,
-			UsageCountToday: a.UsageCountToday,
-			UsageDate:       a.UsageDate,
-			CreatedAt:       a.CreatedAt,
-		})
-	}
-	return result
 }
 
 // ---- API 密钥操作 ----
@@ -517,8 +565,8 @@ func parseLegacyCooldownUntil(raw json.RawMessage) (time.Time, error) {
 	return parsed, nil
 }
 
-// migrateOldAccounts 启动时若库中无账号且存在旧 JSON，导入一次（保留旧文件作备份）。
-func migrateOldAccounts() {
+// MigrateOldAccounts 启动时若库中无账号且存在旧 JSON，导入一次（保留旧文件作备份）。
+func MigrateOldAccounts() {
 	if statsDB == nil {
 		return
 	}
@@ -557,8 +605,8 @@ func migrateOldAccounts() {
 		_, _ = statsDB.Exec(`INSERT INTO accounts
 			(account_id, email, refresh_token, access_token, expires_at, status,
 			 cooldown_until, fail_count, usage_count, usage_count_today, usage_date,
-			 last_used, created_at, last_reason)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 last_used, created_at, last_reason, tokens_total, tokens_today, tokens_date)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,'')`,
 			a.AccountID, a.Email, a.RefreshToken, "", int64(0),
 			a.Status, cooldownMillisByAccount[index], a.FailCount, a.UsageCount, a.UsageCountToday, a.UsageDate,
 			a.LastUsed.UnixMilli(), a.CreatedAt.UnixMilli(), a.LastReason)
@@ -582,10 +630,10 @@ func statsDBExec(query string, args ...any) (sql.Result, error) {
 
 // ---- OAuth 设备码登录添加账号（供 -login / -add-account CLI 模式）----
 
-func addAccountFromDeviceAuth() (*Account, error) {
+func AddAccountFromDeviceAuth() (*Account, error) {
 	fmt.Println("\n=== Add New Cline Account (OAuth) ===")
 
-	device, err := workosDeviceAuth()
+	device, err := cline.WorkosDeviceAuth()
 	if err != nil {
 		return nil, err
 	}
@@ -600,7 +648,7 @@ func addAccountFromDeviceAuth() (*Account, error) {
 	fmt.Println("  2. Enter code: " + device.UserCode)
 	fmt.Println("  3. Log in with Google, GitHub, or email")
 
-	_ = openBrowser(authURL)
+	_ = cline.OpenBrowser(authURL)
 	fmt.Println("  Waiting for authorization...")
 
 	interval := device.Interval
@@ -612,33 +660,33 @@ func addAccountFromDeviceAuth() (*Account, error) {
 		expiresIn = 300
 	}
 
-	workosTok, err := pollWorkosToken(device.DeviceCode, interval, expiresIn)
+	workosTok, err := cline.PollWorkosToken(device.DeviceCode, interval, expiresIn)
 	if err != nil {
 		return nil, err
 	}
 
 	fmt.Println("  WorkOS authorized. Registering with Cline...")
 
-	cline, err := registerWithCline(workosTok.AccessToken, workosTok.RefreshToken)
+	reg, err := cline.RegisterWithCline(workosTok.AccessToken, workosTok.RefreshToken)
 	if err != nil {
 		return nil, err
 	}
 
-	if cline.Data.RefreshToken == "" {
+	if reg.Data.RefreshToken == "" {
 		return nil, fmt.Errorf("cline registration missing refresh token")
 	}
 
 	email := "unknown"
-	if cline.Data.UserInfo != nil && cline.Data.UserInfo.Email != "" {
-		email = cline.Data.UserInfo.Email
+	if reg.Data.UserInfo != nil && reg.Data.UserInfo.Email != "" {
+		email = reg.Data.UserInfo.Email
 	}
 
 	acc := &Account{
 		AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
 		Email:        email,
-		RefreshToken: cline.Data.RefreshToken,
-		AccessToken:  "workos:" + cline.Data.AccessToken,
-		ExpiresAt:    parseExpiry(cline.Data.ExpiresAt) - 60000,
+		RefreshToken: reg.Data.RefreshToken,
+		AccessToken:  "workos:" + reg.Data.AccessToken,
+		ExpiresAt:    cline.ParseExpiry(reg.Data.ExpiresAt) - 60000,
 		Status:       "active",
 		CreatedAt:    time.Now(),
 	}

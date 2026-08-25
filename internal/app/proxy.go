@@ -1,6 +1,8 @@
-package main
+package app
 
 import (
+	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -44,7 +46,7 @@ type chatRequest struct {
 	Extra               map[string]any  `json:"-"`
 }
 
-func startProxy(host string, port int) error {
+func StartProxy(host string, port int) error {
 	if strings.TrimSpace(host) == "" {
 		host = "0.0.0.0"
 	}
@@ -72,6 +74,14 @@ func startProxy(host string, port int) error {
 	freePort(port)
 
 	startModelsRefresher()
+	startZenModelsRefresher()
+	if err := InitStats(); err != nil {
+		log.Printf("WARNING: stats db init failed: %v (database features disabled)", err)
+	}
+	MigrateOldAccounts()
+	LoadRequestLogsFromFile()
+	go cleanupCompactStates()
+	go tokenKeepaliveLoop()
 
 	mux := http.NewServeMux()
 
@@ -141,7 +151,25 @@ func startProxy(host string, port int) error {
 
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
 		ensureModelsFresh()
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": apiModelList()})
+		data := apiModelList()
+		// 合并 zen 免费模型
+		cfg := getZenConfig()
+		if cfg.Enabled {
+			for _, zm := range zenModelList() {
+				data = append(data, map[string]any{
+					"id":       zm["id"],
+					"object":   "model",
+					"created":  time.Now().UnixMilli(),
+					"owned_by": "opencode-zen",
+					"source":   "zen-free",
+					"status":   "active",
+					"cost":     "free",
+					"context":  zm["context"],
+					"output":   zm["output"],
+				})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
 	mux.HandleFunc("/models", modelsHandler)
@@ -190,38 +218,18 @@ func startProxy(host string, port int) error {
 		model, _ := params["model"].(string)
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
 
-		// 校验请求模型是否在上游 free 列表（缓存就绪才拦截）
-		if freeModelsReady() && !modelIsFree(model) {
-			insertRequestRecord(&requestContext{
-				apiFormat: "openai", accountEmail: "no_account",
-				model: model, isStream: isStream, startAt: time.Now(),
-			}, tokenUsage{}, false, 403, "model not in free list: "+model)
-			writeJSON(w, http.StatusForbidden, map[string]any{
-				"error": map[string]string{
-					"message": "model '" + model + "' is not available in free list",
-					"type":    "model_not_allowed",
-				},
+		// Override system prompt from override.md for OpenAI format
+		applyOverride(params)
+
+		// zen 免费模型路由
+		if route := routeModel(model); route == "zen" {
+			handleZenChat(w, r, params)
+			return
+		} else if route == "reject" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", model), "type": "invalid_request_error"},
 			})
 			return
-		}
-
-		// Override system prompt from override.md for OpenAI format
-		if override := loadOverrideContent(); override != "" {
-			if msgs, ok := params["messages"].([]any); ok {
-				found := false
-				for _, m := range msgs {
-					if mm, ok := m.(map[string]any); ok {
-						if mm["role"] == "system" {
-							mm["content"] = override
-							found = true
-							break
-						}
-					}
-				}
-				if !found {
-					params["messages"] = append([]any{map[string]any{"role": "system", "content": override}}, msgs...)
-				}
-			}
 		}
 
 		// 输入 token 上限校验：超限直接拒绝，不请求上游
@@ -252,11 +260,11 @@ func startProxy(host string, port int) error {
 			}
 		}
 
-		resp, ctx, err := callClineAPI(params, upstreamStream)
+		resp, acc, ctx, err := callClineAPI(params, upstreamStream)
 		ctx.apiFormat = "openai"
 		if err != nil {
 			log.Printf("  api error: %v", err)
-			insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, truncate(err.Error(), 2000))
+			insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "api_error"},
 			})
@@ -264,19 +272,24 @@ func startProxy(host string, port int) error {
 		}
 		defer resp.Body.Close()
 
+		usageFn := accountUsageFn(acc, params)
+
 		if isStream {
-			handleStreamResponse(w, resp, ctx)
+			handleStreamResponse(w, resp, ctx, usageFn)
 			return
 		}
 
 		if upstreamStream {
 			out, err := collectStreamResponse(resp)
 			if err != nil {
-				insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, truncate(err.Error(), 2000))
+				insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 				})
 				return
+			}
+			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
+				usageFn(u)
 			}
 			out = normalizeOpenAIResponse(out)
 			contentLen := 0
@@ -294,7 +307,7 @@ func startProxy(host string, port int) error {
 			return
 		}
 
-		handleNonStreamResponse(w, resp, ctx)
+		handleNonStreamResponse(w, resp, ctx, usageFn)
 	})
 	mux.HandleFunc("/v1/chat/completions", chatHandler)
 	mux.HandleFunc("/chat/completions", chatHandler)
@@ -310,6 +323,11 @@ func startProxy(host string, port int) error {
 	mux.HandleFunc("/v1/messages", anthropicHandler)
 	mux.HandleFunc("/messages", anthropicHandler)
 
+	// OpenAI Responses API
+	responsesHandler := apiKeyHandler(handleResponses)
+	mux.HandleFunc("/v1/responses", responsesHandler)
+	mux.HandleFunc("/responses", responsesHandler)
+
 	if host == "" {
 		host = "0.0.0.0"
 	}
@@ -317,7 +335,7 @@ func startProxy(host string, port int) error {
 	proxyListenAddress = addr
 	server := &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: requestLogMiddleware(mux),
 	}
 
 	fmt.Println("")
@@ -337,7 +355,7 @@ func startProxy(host string, port int) error {
 // initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
 // 控制台窗口滚动内容有限，文件可完整保留所有日志。
 func initLogFile() {
-	path := resolveDataPath("cline-proxy.log")
+	path := kit.ResolveDataPath("cline-proxy.log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("  open log file failed: %v", err)
@@ -366,6 +384,114 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// applyOverride 用 override.md 替换系统提示词(不存在则跳过)
+func applyOverride(params map[string]any) {
+	override := loadOverrideContent()
+	if override == "" {
+		return
+	}
+	if msgs, ok := params["messages"].([]any); ok {
+		found := false
+		for _, m := range msgs {
+			if mm, ok := m.(map[string]any); ok {
+				if mm["role"] == "system" {
+					mm["content"] = override
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			params["messages"] = append([]any{map[string]any{"role": "system", "content": override}}, msgs...)
+		}
+	}
+}
+
+// handleZenChat opencode zen 免费模型分支: 压缩 -> 上游 -> 透传,并记录统计
+func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any) {
+	cfg := getZenConfig()
+	if !cfg.Enabled {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]string{"message": "zen upstream disabled in /admin/ settings", "type": "api_error"},
+		})
+		return
+	}
+	model, _ := params["model"].(string)
+	zm, ok := resolveZenFreeModel(model)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": fmt.Sprintf("model %q is not a free zen model", model), "type": "invalid_request_error"},
+		})
+		return
+	}
+	isStream, _ := params["stream"].(bool)
+	tracker := newZenStatsTracker(zenStatsRecord{
+		TS:           time.Now().UnixMilli(),
+		Upstream:     "zen",
+		Model:        zm.ID,
+		Stream:       isStream,
+		PromptTokens: estimateJSON(params),
+	})
+
+	sid := requestSessionID(params, r.Header)
+	out := maybeCompact(params, zm, sid)
+	tracker.rec.Compacted = out.changed
+	tracker.rec.CompactionTokens = out.compactTokens
+	if out.changed {
+		log.Printf("  zen: %s", out.note)
+	}
+
+	resp, rateLimited, err := callZenAPI(params, isStream)
+	if err != nil {
+		log.Printf("  zen api error: %v", err)
+		tracker.rec.RateLimited = rateLimited
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "api_error"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
+		return
+	}
+	tracker.rec.RateLimited = rateLimited
+	defer resp.Body.Close()
+	tracker.rec.Status = resp.StatusCode
+
+	usageFn := func(u map[string]any) {
+		if pt, ok := u["prompt_tokens"].(float64); ok {
+			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
+			if tracker.rec.CompletionTokens < 0 {
+				tracker.rec.CompletionTokens = 0
+			}
+		}
+		if ct, ok := u["completion_tokens"].(float64); ok {
+			tracker.rec.CompletionTokens = int(ct)
+		}
+	}
+
+	if isStream {
+		zenCtx := &requestContext{
+			apiFormat:    "openai",
+			accountEmail:  "zen",
+			model:         zm.ID,
+			isStream:      true,
+			startAt:        time.Now(),
+			statusCode:     resp.StatusCode,
+		}
+		handleStreamResponse(w, resp, zenCtx, usageFn)
+		tracker.finish(true, resp.StatusCode)
+		return
+	}
+	zenCtx := &requestContext{
+		apiFormat:    "openai",
+		accountEmail:  "zen",
+		model:         zm.ID,
+		isStream:      false,
+		startAt:        time.Now(),
+		statusCode:     resp.StatusCode,
+	}
+	handleNonStreamResponse(w, resp, zenCtx, usageFn)
+	tracker.finish(true, resp.StatusCode)
 }
 
 func cleanMessages(messages []any) []any {
@@ -444,7 +570,7 @@ func clineHeaders(token, sessionID string) http.Header {
 	return h
 }
 
-func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestContext, error) {
+func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, *requestContext, error) {
 	model, _ := params["model"].(string)
 	ctx := &requestContext{
 		model:    model,
@@ -455,14 +581,14 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 	acc := pickAccount()
 	if acc == nil {
 		ctx.accountEmail = "no_account"
-		return nil, ctx, fmt.Errorf("no active accounts available: %s", describePoolStatus())
+		return nil, nil, ctx, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 	ctx.accountEmail = acc.Email
 
 	token, err := ensureAccountToken(acc)
 	if err != nil {
 		// refreshAccountToken 内部已置 status=expired
-		return nil, ctx, fmt.Errorf("account %s token failed: %w", acc.Email, err)
+		return nil, acc, ctx, fmt.Errorf("account %s token failed: %w", acc.Email, err)
 	}
 
 	body := buildUpstreamBody(params, stream)
@@ -470,12 +596,12 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return nil, ctx, fmt.Errorf("marshal body: %w", err)
+		return nil, acc, ctx, fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 	if err != nil {
-		return nil, ctx, fmt.Errorf("create request: %w", err)
+		return nil, acc, ctx, fmt.Errorf("create request: %w", err)
 	}
 	req.Header = clineHeaders(token, sessionID)
 
@@ -488,11 +614,11 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
 		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := httpClient.Do(req)
+	resp, err := kit.HTTPClient.Do(req)
 	if err != nil {
 		// 网络错误：临时短冷却 5 分钟
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
-		return nil, ctx, fmt.Errorf("upstream request: %w", err)
+		return nil, acc, ctx, fmt.Errorf("upstream request: %w", err)
 	}
 
 	if resp.StatusCode == 401 {
@@ -501,22 +627,22 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 		if err := refreshAccountToken(acc); err == nil {
 			token = acc.AccessToken
 			req.Header = clineHeaders(token, sessionID)
-			resp, err = httpClient.Do(req)
+			resp, err = kit.HTTPClient.Do(req)
 			if err != nil {
-				return nil, ctx, fmt.Errorf("upstream retry: %w", err)
+				return nil, acc, ctx, fmt.Errorf("upstream retry: %w", err)
 			}
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
 				ctx.statusCode = 401
 				acc.Status = "expired"
 				_, _ = statsDBExec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
-				return nil, ctx, fmt.Errorf("account %s token expired permanently", acc.Email)
+				return nil, acc, ctx, fmt.Errorf("account %s token expired permanently", acc.Email)
 			}
 		} else {
 			ctx.statusCode = 401
 			acc.Status = "expired"
 			_, _ = statsDBExec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
-			return nil, ctx, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
+			return nil, acc, ctx, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
 		}
 	}
 
@@ -526,7 +652,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 		ctx.statusCode = resp.StatusCode
 		// 429 限流：优先使用上游返回的明确等待时长，否则指数退避
 		if resp.StatusCode == 429 {
-			reason := truncate(string(bodyBytes), 500)
+			reason := kit.Truncate(string(bodyBytes), 500)
 			duration := parseInferenceCapDuration(string(bodyBytes))
 			if duration <= 0 {
 				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -534,12 +660,32 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *requestC
 			markCooldown(acc, duration, "429: "+reason)
 			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
 		}
-		return nil, ctx, fmt.Errorf("API %d: %s", resp.StatusCode, truncate(string(bodyBytes), 500))
+		return nil, acc, ctx, fmt.Errorf("API %d: %s", resp.StatusCode, kit.Truncate(string(bodyBytes), 500))
 	}
 
 	ctx.statusCode = 200
 	markSuccess(acc)
-	return resp, ctx, nil
+	return resp, acc, ctx, nil
+}
+
+// accountUsageFn 构造账号 token 记账回调：从上游 usage 提取
+// prompt_tokens + completion_tokens，计入该账号今日/累计消耗。
+func accountUsageFn(acc *Account, params map[string]any) func(map[string]any) {
+	return func(u map[string]any) {
+		var pt, ct float64
+		if v, ok := u["prompt_tokens"].(float64); ok {
+			pt = v
+		}
+		if v, ok := u["completion_tokens"].(float64); ok {
+			ct = v
+		}
+		tokens := int64(pt + ct)
+		if tokens <= 0 && params != nil {
+			// 上游未返回 usage 时用入站请求估算兜底（与 zen 统计一致）
+			tokens = int64(estimateJSON(params))
+		}
+		recordAccountTokens(acc, tokens)
+	}
 }
 
 func truncateEmail(email string) string {
@@ -572,7 +718,7 @@ func getMsgCount(params map[string]any) int {
 	return 0
 }
 
-func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
+func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -612,6 +758,11 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *r
 			// Try to normalize the response
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+				if onUsage != nil {
+					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+						onUsage(u)
+					}
+				}
 				// Some Cline responses wrap in {data: {...}}
 				if data, ok := obj["data"]; ok {
 					if d, ok := data.(map[string]any); ok {
@@ -642,7 +793,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *r
 	insertRequestRecord(ctx, u, true, 200, "")
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext) {
+func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) {
 	var raw map[string]any
 	if err := json.NewDecoder(upstream.Body).Decode(&raw); err != nil {
 		insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
@@ -650,6 +801,12 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
 		return
+	}
+
+	if onUsage != nil {
+		if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
+			onUsage(u)
+		}
 	}
 
 	// Some Cline responses wrap in {data: {...}}
@@ -1017,7 +1174,7 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 					msgs = append(msgs, tr)
 					content, _ := tr["content"].(string)
 					id, _ := tr["tool_call_id"].(string)
-					log.Printf("  anthropic req: tool_result id=%s content_len=%d prefix=%s", id, len(content), truncate(content, 400))
+					log.Printf("  anthropic req: tool_result id=%s content_len=%d prefix=%s", id, len(content), kit.Truncate(content, 400))
 				}
 			} else {
 				content := strings.Join(textParts, "\n")
@@ -1084,7 +1241,7 @@ func parseToolArgs(raw string) (any, error) {
 			}
 		}
 	}
-	return nil, fmt.Errorf("invalid json: %s", truncate(raw, 120))
+	return nil, fmt.Errorf("invalid json: %s", kit.Truncate(raw, 120))
 }
 
 // extractToolSchemas 从 Anthropic 请求的 tools 定义中解析每个工具的 input_schema 属性集合，
@@ -1313,17 +1470,13 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
-	// 校验请求模型是否在上游 free 列表（缓存就绪才拦截）
-	if freeModelsReady() && !modelIsFree(req.Model) {
-		insertRequestRecord(&requestContext{
-			apiFormat: "anthropic", accountEmail: "no_account",
-			model: req.Model, isStream: req.Stream, startAt: time.Now(),
-		}, tokenUsage{}, false, 403, "model not in free list: "+req.Model)
-		writeJSON(w, http.StatusForbidden, map[string]any{
-			"error": map[string]string{
-				"message": "model '" + req.Model + "' is not available in free list",
-				"type":    "model_not_allowed",
-			},
+	// zen 免费模型路由
+	if route := routeModel(req.Model); route == "zen" {
+		handleZenAnthropic(w, r, req, openAIReq, toolSchemas)
+		return
+	} else if route == "reject" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", req.Model), "type": "invalid_request_error"},
 		})
 		return
 	}
@@ -1372,11 +1525,11 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
 	}
 
-	resp, ctx, err := callClineAPI(openAIReq, upstreamStream)
+	resp, acc, ctx, err := callClineAPI(openAIReq, upstreamStream)
 	ctx.apiFormat = "anthropic"
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
-		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, truncate(err.Error(), 2000))
+		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
@@ -1384,19 +1537,24 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	usageFn := accountUsageFn(acc, openAIReq)
+
 	if req.Stream {
-		handleAnthropicStream(w, resp, ctx, normalizeRequestModel(req.Model), toolSchemas)
+		handleAnthropicStream(w, resp, ctx, normalizeRequestModel(req.Model), toolSchemas, usageFn)
 		return
 	}
 
 	if upstreamStream {
 		out, err := collectStreamResponse(resp)
 		if err != nil {
-			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, truncate(err.Error(), 2000))
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
 			return
+		}
+		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
+			usageFn(u)
 		}
 		out = normalizeOpenAIResponse(out)
 
@@ -1421,6 +1579,9 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
+		usageFn(u)
+	}
 	out := raw
 	if data, ok := raw["data"]; ok {
 		if d, ok := data.(map[string]any); ok {
@@ -1442,7 +1603,100 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	insertRequestRecord(ctx, u2, true, 200, "")
 }
 
-func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, modelName string, toolSchemas map[string]map[string]bool) {
+// handleZenAnthropic Anthropic Messages 请求路由到 zen 免费模型上游
+func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq, openAIReq map[string]any, toolSchemas map[string]map[string]bool) {
+	cfg := getZenConfig()
+	if !cfg.Enabled {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]string{"message": "zen upstream disabled in /admin/ settings", "type": "api_error"},
+		})
+		return
+	}
+	zm, ok := resolveZenFreeModel(req.Model)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": fmt.Sprintf("model %q is not a free zen model", req.Model), "type": "invalid_request_error"},
+		})
+		return
+	}
+	isStream := req.Stream
+	tracker := newZenStatsTracker(zenStatsRecord{
+		TS:           time.Now().UnixMilli(),
+		Upstream:     "zen",
+		Model:        zm.ID,
+		Stream:       isStream,
+		PromptTokens: estimateJSON(openAIReq),
+	})
+
+	sid := requestSessionID(openAIReq, r.Header)
+	out := maybeCompact(openAIReq, zm, sid)
+	tracker.rec.Compacted = out.changed
+	tracker.rec.CompactionTokens = out.compactTokens
+	if out.changed {
+		log.Printf("  anthropic zen: %s", out.note)
+	}
+
+	resp, rateLimited, err := callZenAPI(openAIReq, isStream)
+	if err != nil {
+		log.Printf("  anthropic zen api error: %v", err)
+		tracker.rec.RateLimited = rateLimited
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "api_error"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
+		return
+	}
+	tracker.rec.RateLimited = rateLimited
+	defer resp.Body.Close()
+	tracker.rec.Status = resp.StatusCode
+
+	usageFn := func(u map[string]any) {
+		if ct, ok := u["completion_tokens"].(float64); ok {
+			tracker.rec.CompletionTokens = int(ct)
+		}
+	}
+
+	if isStream {
+		zenCtx := &requestContext{
+			apiFormat:    "anthropic",
+			accountEmail:  "zen",
+			model:         req.Model,
+			isStream:      true,
+			startAt:        time.Now(),
+			statusCode:     resp.StatusCode,
+		}
+		handleAnthropicStream(w, resp, zenCtx, zm.ID, toolSchemas, usageFn)
+		tracker.finish(true, resp.StatusCode)
+		return
+	}
+
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+		})
+		tracker.finish(false, http.StatusInternalServerError)
+		return
+	}
+	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
+		usageFn(u)
+	}
+	chatOut := raw
+	if data, ok := raw["data"]; ok {
+		if d, ok := data.(map[string]any); ok {
+			chatOut = d
+		}
+	}
+	chatOut = normalizeOpenAIResponse(chatOut)
+	anthropicResp := openAIToAnthropic(chatOut)
+	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+		anthropicResp["stop_reason"] = "tool_use"
+	}
+	writeJSON(w, http.StatusOK, anthropicResp)
+	tracker.finish(true, resp.StatusCode)
+}
+
+func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
 	log.Printf("  anthropic stream: starting real-time forward")
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1457,7 +1711,7 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 
 	var u tokenUsage
 	var streamLog *os.File
-	if sf, err := os.OpenFile(resolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+	if sf, err := os.OpenFile(kit.ResolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 		streamLog = sf
 	}
 	defer func() {
@@ -1519,7 +1773,7 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 		}
 		argsObj, err := parseToolArgs(acc.args)
 		if err != nil {
-			log.Printf("  tool args parse failed for %s: %v (raw: %s)", acc.name, err, truncate(acc.args, 300))
+			log.Printf("  tool args parse failed for %s: %v (raw: %s)", acc.name, err, kit.Truncate(acc.args, 300))
 			argsObj = map[string]any{}
 		}
 		if inputMap, ok := argsObj.(map[string]any); ok {
@@ -1564,6 +1818,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
 			return
+		}
+		if onUsage != nil {
+			if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+				onUsage(u)
+			}
 		}
 		if data, ok := obj["data"]; ok {
 			if d, ok := data.(map[string]any); ok {
@@ -1812,10 +2071,19 @@ func freePort(port int) {
 	conn.Close()
 
 	// Try to kill the process using the port
-	cmd := execCommand("powershell", "-Command",
-		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){Stop-Process -Id $p.OwningProcess -Force}`, port))
+	cmd := kit.ExecCommand("powershell", "-Command",
+		fmt.Sprintf(`$p=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue; if($p){$p.OwningProcess | Sort-Object -Unique | ForEach-Object {Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue}}`, port))
 	_ = cmd.Run()
-	time.Sleep(500 * time.Millisecond)
+	// 杀进程后确认端口确实释放，避免旧进程尚未退出时立刻竞争监听。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			return
+		}
+		conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // parseInferenceCapDuration 从 Cline 429 错误体中解析 "Try again in 17h 59m" 形式的等待时长。

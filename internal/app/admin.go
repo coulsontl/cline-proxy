@@ -1,6 +1,8 @@
-package main
+package app
 
 import (
+	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -57,6 +59,8 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/refresh-all", corsHandler(handleAdminRefreshAll))
 	mux.HandleFunc("/admin/api/accounts/delete-all", corsHandler(handleAdminDeleteAll))
 	mux.HandleFunc("/admin/api/accounts/reset", corsHandler(handleAdminAccountReset))
+	mux.HandleFunc("/admin/api/accounts/export", corsHandler(handleAccountsExport))
+	mux.HandleFunc("/admin/api/logs", corsHandler(handleRequestLogs))
 	mux.HandleFunc("/admin/api/keys", corsHandler(handleAdminGetKeys))
 	mux.HandleFunc("/admin/api/keys/generate", corsHandler(handleAdminGenerateKey))
 	mux.HandleFunc("/admin/api/keys/delete", corsHandler(handleAdminDeleteKey))
@@ -72,6 +76,20 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/override", corsHandler(handleOverride))
 	mux.HandleFunc("/admin/api/model-limits", corsHandler(handleModelLimits))
 	mux.HandleFunc("/admin/api/model-limits/update", corsHandler(handleModelLimitUpdate))
+	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
+	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
+	mux.HandleFunc("/admin/api/opencode/models", corsHandler(handleZenModels))
+	mux.HandleFunc("/admin/api/opencode/models/refresh", corsHandler(handleZenModelsRefresh))
+	mux.HandleFunc("/admin/api/opencode/stats", corsHandler(handleZenStats))
+	// 旧 zen 路径别名,兼容旧引用
+	mux.HandleFunc("/admin/api/zen/config", corsHandler(handleZenConfig))
+	mux.HandleFunc("/admin/api/zen/config/update", corsHandler(handleZenConfigUpdate))
+	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
+	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
+	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
+	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/admin/", http.StatusFound)
+	})
 }
 
 // GET /admin/api/override 返回 override.md 内容；POST 保存。
@@ -123,7 +141,7 @@ func handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	accounts := listAccounts()
+	accounts := ListAccounts()
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Data: map[string]any{
@@ -162,7 +180,7 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate by refreshing
-	resp, err := refreshClineToken(req.RefreshToken)
+	resp, err := cline.RefreshClineToken(req.RefreshToken)
 	if err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid refreshToken: " + err.Error()})
 		return
@@ -177,7 +195,7 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 		Email:        req.Email,
 		RefreshToken: req.RefreshToken,
 		AccessToken:  "workos:" + resp.Data.AccessToken,
-		ExpiresAt:    parseExpiry(resp.Data.ExpiresAt) - 60000,
+		ExpiresAt:    cline.ParseExpiry(resp.Data.ExpiresAt) - 60000,
 		Status:       "active",
 		CreatedAt:    time.Now(),
 	}
@@ -243,7 +261,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	device, err := workosDeviceAuth()
+	device, err := cline.WorkosDeviceAuth()
 	if err != nil {
 		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
 		return
@@ -277,7 +295,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			expiresIn = 300
 		}
 
-		workosTok, err := pollWorkosToken(device.DeviceCode, interval, expiresIn)
+		workosTok, err := cline.PollWorkosToken(device.DeviceCode, interval, expiresIn)
 		if err != nil {
 			oauthSessionsMu.Lock()
 			state.Error = err.Error()
@@ -287,7 +305,7 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cline, err := registerWithCline(workosTok.AccessToken, workosTok.RefreshToken)
+		reg, err := cline.RegisterWithCline(workosTok.AccessToken, workosTok.RefreshToken)
 		if err != nil {
 			oauthSessionsMu.Lock()
 			state.Error = err.Error()
@@ -298,16 +316,16 @@ func handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		}
 
 		email := "unknown"
-		if cline.Data.UserInfo != nil && cline.Data.UserInfo.Email != "" {
-			email = cline.Data.UserInfo.Email
+		if reg.Data.UserInfo != nil && reg.Data.UserInfo.Email != "" {
+			email = reg.Data.UserInfo.Email
 		}
 
 		acc := &Account{
 			AccountID:    fmt.Sprintf("acc_%d", time.Now().UnixMilli()),
 			Email:        email,
-			RefreshToken: cline.Data.RefreshToken,
-			AccessToken:  "workos:" + cline.Data.AccessToken,
-			ExpiresAt:    parseExpiry(cline.Data.ExpiresAt) - 60000,
+			RefreshToken: reg.Data.RefreshToken,
+			AccessToken:  "workos:" + reg.Data.AccessToken,
+			ExpiresAt:    cline.ParseExpiry(reg.Data.ExpiresAt) - 60000,
 			Status:       "active",
 			CreatedAt:    time.Now(),
 		}
@@ -415,9 +433,9 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 		// Try to use the cookie as a refresh token directly (common format)
 		if strings.HasPrefix(line, "workos:") || len(line) > 20 {
 			token := strings.TrimPrefix(line, "workos:")
-			resp, err := refreshClineToken(token)
+			resp, err := cline.RefreshClineToken(token)
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("token %s...: %v", truncate(token, 16), err))
+				errors = append(errors, fmt.Sprintf("token %s...: %v", kit.Truncate(token, 16), err))
 				continue
 			}
 			email := req.Email
@@ -430,7 +448,7 @@ func handleSSOImport(w http.ResponseWriter, r *http.Request) {
 				Email:        email,
 				RefreshToken: token,
 				AccessToken:  "workos:" + resp.Data.AccessToken,
-				ExpiresAt:    parseExpiry(resp.Data.ExpiresAt) - 60000,
+				ExpiresAt:    cline.ParseExpiry(resp.Data.ExpiresAt) - 60000,
 				Status:       "active",
 				CreatedAt:    time.Now(),
 			}
@@ -493,7 +511,7 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 		if t.RefreshToken == "" {
 			continue
 		}
-		resp, err := refreshClineToken(t.RefreshToken)
+		resp, err := cline.RefreshClineToken(t.RefreshToken)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", t.Email, err))
 			continue
@@ -507,7 +525,7 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 			Email:        email,
 			RefreshToken: t.RefreshToken,
 			AccessToken:  "workos:" + resp.Data.AccessToken,
-			ExpiresAt:    parseExpiry(resp.Data.ExpiresAt) - 60000,
+			ExpiresAt:    cline.ParseExpiry(resp.Data.ExpiresAt) - 60000,
 			Status:       "active",
 			CreatedAt:    time.Now(),
 		}
@@ -558,7 +576,8 @@ func handleAdminDeleteAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /admin/api/accounts/reset  body: { accountId }
-// 仅重置该账号的今日使用次数，不影响总次数、状态和 Token。
+// 检测限流并解除：向上游发送探测请求。若上游仍限流（429）则保持冷却，
+// 重置无效；若探测成功则清除冷却、恢复正常状态，并重置今日统计。
 func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -585,8 +604,37 @@ func handleAdminAccountReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resetTodayUsage(acc)
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "本地今日调用统计已重置"})
+	result, status := testAccount(acc)
+
+	if status == "active" {
+		// 探测通过：解除冷却并重置今日统计
+		resetTodayUsage(acc)
+		writeAPI(w, http.StatusOK, apiResponse{
+			Success: true,
+			Message: "检测通过：上游未限流，已解除冷却并重置今日统计",
+			Data:    result,
+		})
+		return
+	}
+
+	// 仍限流/失效：保持冷却，重置无效
+	msg := "上游仍限流，重置无效，保持冷却"
+	if status == "expired" {
+		msg = "Token 已失效，重置无效"
+	} else if status == "error" {
+		msg = "探测异常，请稍后重试"
+	}
+	if until, ok := result["cooldownUntil"].(string); ok && until != "" {
+		msg += "（预计恢复 " + until + "）"
+	}
+	if remaining, ok := result["remaining"].(string); ok && remaining != "" {
+		msg += "（剩余 " + remaining + "）"
+	}
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: false,
+		Message: msg,
+		Data:    result,
+	})
 }
 
 // POST /admin/api/accounts/test  body: { accountId }
@@ -677,7 +725,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	bodyJSON, _ := json.Marshal(probeBody)
 
-	req, err := http.NewRequest("POST", clineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
 	if err != nil {
 		return map[string]any{
 			"accountId": acc.AccountID,
@@ -688,7 +736,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	req.Header = clineHeaders(token, sessionID)
 
-	resp, err := httpClient.Do(req)
+	resp, err := kit.HTTPClient.Do(req)
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
@@ -711,7 +759,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 		if duration <= 0 {
 			duration = parseRetryAfter(resp.Header.Get("Retry-After"))
 		}
-		reason := truncate(bodyStr, 500)
+		reason := kit.Truncate(bodyStr, 500)
 		markAccountCooldown(acc, "429: "+reason, duration)
 		log.Printf("Test hit 429 on %s, cooldown %v", truncateEmail(acc.Email), duration)
 		return map[string]any{
@@ -746,7 +794,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 			"accountId":  acc.AccountID,
 			"email":      acc.Email,
 			"status":     "error",
-			"reason":     fmt.Sprintf("API %d: %s", resp.StatusCode, truncate(bodyStr, 300)),
+			"reason":     fmt.Sprintf("API %d: %s", resp.StatusCode, kit.Truncate(bodyStr, 300)),
 			"httpStatus": resp.StatusCode,
 		}, "error"
 	}
@@ -1020,6 +1068,49 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"expired":  expired,
 			"strategy": "round_robin",
 			"version":  "go-1.1",
+		},
+	})
+}
+
+// GET /admin/api/accounts/export 导出全部账号 refreshToken（JSON 文件下载）
+func handleAccountsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	p := loadPool()
+	items := make([]map[string]any, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
+		items = append(items, map[string]any{
+			"refreshToken": a.RefreshToken,
+			"email":        a.Email,
+		})
+	}
+	data, _ := json.MarshalIndent(items, "", "  ")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="cline-accounts-export.json"`)
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// GET /admin/api/logs 最近请求日志（对话/调用历史）
+func handleRequestLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	logs := LoadRequestLogs()
+	if logs == nil {
+		logs = []RequestLog{}
+	}
+	// 倒序返回（最新在前）
+	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
+		logs[i], logs[j] = logs[j], logs[i]
+	}
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Data: map[string]any{
+			"logs": logs,
 		},
 	})
 }

@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"database/sql"
@@ -118,7 +118,7 @@ func TestCollectStreamResponseAggregatesInterleavedToolCallsByIndex(t *testing.T
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}`,
 		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
-		"",
+		``,
 	}, "\n")
 	response := &http.Response{Body: io.NopCloser(strings.NewReader(sse))}
 
@@ -203,7 +203,10 @@ func TestLoadPoolResetsAndPersistsStaleDailyUsage(t *testing.T) {
 			account_id TEXT PRIMARY KEY, email TEXT, refresh_token TEXT, access_token TEXT,
 			expires_at INTEGER, status TEXT, cooldown_until INTEGER, fail_count INTEGER,
 			usage_count INTEGER, usage_count_today INTEGER, usage_date TEXT,
-			last_used INTEGER, created_at INTEGER, last_reason TEXT
+			last_used INTEGER, created_at INTEGER, last_reason TEXT,
+			tokens_total INTEGER NOT NULL DEFAULT 0,
+			tokens_today INTEGER NOT NULL DEFAULT 0,
+			tokens_date TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE api_keys (key TEXT PRIMARY KEY, created_at INTEGER)`,
 		`CREATE TABLE proxy_state (id INTEGER PRIMARY KEY, current_idx INTEGER)`,
@@ -218,8 +221,9 @@ func TestLoadPoolResetsAndPersistsStaleDailyUsage(t *testing.T) {
 	yesterday := time.Now().Add(-24 * time.Hour).Format("2006-01-02")
 	if _, err := database.Exec(`INSERT INTO accounts
 		(account_id, email, refresh_token, access_token, expires_at, status, cooldown_until,
-		 fail_count, usage_count, usage_count_today, usage_date, last_used, created_at, last_reason)
-		VALUES ('account-1', 'test@example.com', '', '', 0, 'active', 0, 0, 12, 7, ?, 0, 0, '')`, yesterday); err != nil {
+		 fail_count, usage_count, usage_count_today, usage_date, last_used, created_at, last_reason,
+		 tokens_total, tokens_today, tokens_date)
+		VALUES ('account-1', 'test@example.com', '', '', 0, 'active', 0, 0, 12, 7, ?, 0, 0, '', 0, 0, ?)`, yesterday, yesterday); err != nil {
 		t.Fatalf("insert test account: %v", err)
 	}
 

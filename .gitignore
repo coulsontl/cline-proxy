@@ -15,5 +15,13 @@ cline-proxy.log
 
 # Local data
 .cline-accounts.json
+.cline-credentials.json
+.zen-config.json
+zen-stats.jsonl
+cline-proxy.log
+cline-proxy-stream.log
 data/
 override.md
+# Local debug tool (kept locally, not uploaded)
+capture.go
+capture-logs/

@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"encoding/json"
@@ -11,7 +11,7 @@ import (
 // 用 OpenAI 的 O200kBase 编码器本地估算输入 token 数（参考 cli-proxy-api 做法）。
 // 对 GLM/OpenAI 系英文较准，中文略偏低但足够用于"明显超限"拦截。
 var (
-	tokenizerOnce sync.Once
+	tokenizerOnce  sync.Once
 	tokenizerCodec tokenizer.Codec
 	tokenizerErr   error
 )
