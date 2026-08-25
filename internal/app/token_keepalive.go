@@ -23,7 +23,7 @@ func keepaliveAccounts() {
 		return
 	}
 	rows, err := statsDB.Query(`SELECT account_id, email, refresh_token, access_token, expires_at, status
-		FROM accounts WHERE status != 'expired'`)
+		FROM accounts WHERE status = 'active'`)
 	if err != nil {
 		log.Printf("keepalive query: %v", err)
 		return

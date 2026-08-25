@@ -470,27 +470,12 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		zenCtx := &requestContext{
-			apiFormat:    "openai",
-			accountEmail:  "zen",
-			model:         zm.ID,
-			isStream:      true,
-			startAt:        time.Now(),
-			statusCode:     resp.StatusCode,
-		}
-		handleStreamResponse(w, resp, zenCtx, usageFn)
+		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）
+		handleStreamResponse(w, resp, nil, usageFn)
 		tracker.finish(true, resp.StatusCode)
 		return
 	}
-	zenCtx := &requestContext{
-		apiFormat:    "openai",
-		accountEmail:  "zen",
-		model:         zm.ID,
-		isStream:      false,
-		startAt:        time.Now(),
-		statusCode:     resp.StatusCode,
-	}
-	handleNonStreamResponse(w, resp, zenCtx, usageFn)
+	handleNonStreamResponse(w, resp, nil, usageFn)
 	tracker.finish(true, resp.StatusCode)
 }
 
@@ -618,6 +603,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	if err != nil {
 		// 网络错误：临时短冷却 5 分钟
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
+		ctx.statusCode = http.StatusBadGateway
 		return nil, acc, ctx, fmt.Errorf("upstream request: %w", err)
 	}
 
@@ -1657,15 +1643,8 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	}
 
 	if isStream {
-		zenCtx := &requestContext{
-			apiFormat:    "anthropic",
-			accountEmail:  "zen",
-			model:         req.Model,
-			isStream:      true,
-			startAt:        time.Now(),
-			statusCode:     resp.StatusCode,
-		}
-		handleAnthropicStream(w, resp, zenCtx, zm.ID, toolSchemas, usageFn)
+		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）
+		handleAnthropicStream(w, resp, nil, zm.ID, toolSchemas, usageFn)
 		tracker.finish(true, resp.StatusCode)
 		return
 	}

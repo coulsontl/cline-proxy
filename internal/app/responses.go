@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -501,8 +502,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, _, err := callClineAPI(chat, stream)
+	up, acc, ctx, err := callClineAPI(chat, stream)
+	ctx.apiFormat = "openai"
 	if err != nil {
+		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "api_error"},
 		})
@@ -518,27 +521,39 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusOK)
 		chatStreamToResponses(w, up, usageFn)
+		insertRequestRecord(ctx, tokenUsage{}, true, 200, "")
 		return
 	}
 	if stream {
 		out, err := collectStreamResponse(up)
 		if err != nil {
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
-			usageFn(u)
+		var u tokenUsage
+		if usage, ok := out["usage"].(map[string]any); ok {
+			extractOpenAIUsage(usage, &u)
+			if len(usage) > 0 {
+				usageFn(usage)
+			}
 		}
 		writeJSON(w, http.StatusOK, chatToResponses(out))
+		insertRequestRecord(ctx, u, true, 200, "")
 		return
 	}
 	var raw map[string]any
 	if err := json.NewDecoder(up.Body).Decode(&raw); err != nil {
+		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
+	var u tokenUsage
+	if usage, ok := raw["usage"].(map[string]any); ok {
+		extractOpenAIUsage(usage, &u)
+		if len(usage) > 0 {
+			usageFn(usage)
+		}
 	}
 	out := raw
 	if data, ok := raw["data"]; ok {
@@ -547,4 +562,5 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, chatToResponses(out))
+	insertRequestRecord(ctx, u, true, 200, "")
 }
