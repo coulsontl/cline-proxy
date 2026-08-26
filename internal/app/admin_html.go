@@ -16,8 +16,8 @@ const adminHTML = `<!DOCTYPE html>
   --glow:0 0 0 1px rgba(34,211,238,.25),0 0 24px rgba(34,211,238,.12);
   --status-active-bg:rgba(52,211,153,.14);--status-cooldown-bg:rgba(245,158,11,.14);
   --status-expired-bg:rgba(248,113,113,.14);
-  --btn-primary-bg:linear-gradient(135deg,#0ea5e9,#22d3ee);--btn-primary-hover:linear-gradient(135deg,#0284c7,#0ea5e9);
-  --btn-success-bg:linear-gradient(135deg,#059669,#34d399);--btn-success-hover:linear-gradient(135deg,#047857,#059669);
+  --btn-primary-bg:linear-gradient(135deg,#0ea5e9,#22d3ee);--btn-primary-hover:linear-gradient(135deg,#0284c7,#0ea5e9);--btn-primary-fg:#04121a;
+  --btn-success-bg:linear-gradient(135deg,#059669,#34d399);--btn-success-hover:linear-gradient(135deg,#047857,#059669);--btn-success-fg:#04231a;
   --radius:14px;--radius-sm:9px;
 }
 [data-theme="light"]{
@@ -29,8 +29,8 @@ const adminHTML = `<!DOCTYPE html>
   --glow:0 0 0 1px rgba(8,145,178,.22),0 6px 24px rgba(8,145,178,.10);
   --status-active-bg:rgba(5,150,105,.12);--status-cooldown-bg:rgba(180,83,9,.12);
   --status-expired-bg:rgba(220,38,38,.10);
-  --btn-primary-bg:linear-gradient(135deg,#0284c7,#06b6d4);--btn-primary-hover:linear-gradient(135deg,#0369a1,#0284c7);
-  --btn-success-bg:linear-gradient(135deg,#059669,#10b981);--btn-success-hover:linear-gradient(135deg,#047857,#059669);
+  --btn-primary-bg:linear-gradient(135deg,#0284c7,#06b6d4);--btn-primary-hover:linear-gradient(135deg,#0369a1,#0284c7);--btn-primary-fg:#ffffff;
+  --btn-success-bg:linear-gradient(135deg,#059669,#10b981);--btn-success-hover:linear-gradient(135deg,#047857,#059669);--btn-success-fg:#ffffff;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -112,16 +112,16 @@ tbody tr:last-child td{border-bottom:none}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 15px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(148,163,184,.08);color:var(--text);cursor:pointer;font-size:13px;transition:.18s;text-decoration:none;font-family:inherit;white-space:nowrap}
 .btn:hover{background:rgba(148,163,184,.16);border-color:var(--border-strong);transform:translateY(-1px)}
 .btn:active{transform:none}
-.btn-primary{background:var(--btn-primary-bg);border-color:transparent;color:#04121a;font-weight:600;box-shadow:0 4px 14px rgba(14,165,233,.28)}
+.btn-primary{background:var(--btn-primary-bg);border-color:transparent;color:var(--btn-primary-fg);font-weight:600;box-shadow:0 4px 14px rgba(14,165,233,.28)}
 .btn-primary:hover{background:var(--btn-primary-hover);box-shadow:0 6px 18px rgba(14,165,233,.38)}
-.btn-success{background:var(--btn-success-bg);border-color:transparent;color:#04231a;font-weight:600;box-shadow:0 4px 14px rgba(5,150,105,.28)}
+.btn-success{background:var(--btn-success-bg);border-color:transparent;color:var(--btn-success-fg);font-weight:600;box-shadow:0 4px 14px rgba(5,150,105,.28)}
 .btn-success:hover{background:var(--btn-success-hover)}
 .btn-danger{border-color:rgba(248,113,113,.4);color:var(--danger);background:transparent}
 .btn-danger:hover{background:rgba(248,113,113,.12);border-color:var(--danger)}
 .btn-sm{padding:3px 10px;font-size:12px;border-radius:7px}
 
 /* ===== 表单 ===== */
-input,textarea,select{width:100%;padding:9px 13px;background:rgba(2,6,23,.4);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13px;font-family:inherit;transition:.15s}
+input,textarea,select{width:100%;padding:9px 13px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13px;font-family:inherit;transition:.15s}
 [data-theme="light"] input,[data-theme="light"] textarea,[data-theme="light"] select{background:rgba(15,23,42,.03)}
 input::placeholder,textarea::placeholder{color:var(--text3)}
 input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,211,238,.15)}
@@ -1013,7 +1013,7 @@ async function refreshModels() {
   try {
     _('modelsProbeInfo').textContent = '· 同步中...';
     const d = await api('POST', '/models/refresh');
-    toast(d.data.message || '同步已开始', 'info');
+    toast(d.message || '同步已开始', 'info');
     setTimeout(loadModels, 3000);
   } catch (e) { toast('刷新失败: ' + e.message, 'error'); _('modelsProbeInfo').textContent = ''; }
 }
