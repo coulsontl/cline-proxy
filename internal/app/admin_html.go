@@ -154,7 +154,7 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .empty{padding:30px;text-align:center;color:var(--text2)}
 .empty-state{padding:44px 20px;text-align:center;color:var(--text2)}
 .empty-state .icon{font-size:40px;margin-bottom:10px;display:block;opacity:.8}
-.key-display{background:rgba(2,6,23,.45);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
+.key-display{background:var(--bg3);color:var(--text);padding:9px 13px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:'JetBrains Mono','Cascadia Code',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:.15s}
 .key-display:hover{background:rgba(34,211,238,.08);border-color:var(--accent)}
 .copy-icon{cursor:pointer;color:var(--text2);padding:2px 6px;border-radius:4px}
 .copy-icon:hover{color:var(--text);background:var(--bg3)}
