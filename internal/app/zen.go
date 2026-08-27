@@ -3,6 +3,7 @@ package app
 import (
 	"cline-go-proxy/internal/kit"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,22 +18,25 @@ import (
 
 // ZenModel opencode zen 免费模型定义
 type ZenModel struct {
-	ID      string   `json:"id"`
-	Aliases []string `json:"aliases,omitempty"`
-	Context int      `json:"context"`
-	Output  int      `json:"output"`
-	Source  string   `json:"source"` // seed=内置 / synced=动态同步
+	ID       string   `json:"id"`
+	Aliases  []string `json:"aliases,omitempty"`
+	Context  int      `json:"context"`
+	Output   int      `json:"output"`
+	Source   string   `json:"source"`   // seed=内置 / synced=动态同步
+	Name     string   `json:"name,omitempty"`     // models.dev 显示名
+	Provider string   `json:"provider,omitempty"` // models.dev provider
+	Protocol string   `json:"protocol,omitempty"` // 原生协议 chat/responses/anthropic（功能3）
 }
 
 var zenSeedModels = []ZenModel{
-	{"deepseek-v4-flash-free", []string{"deepseek-v4-flash", "deepseek-v4"}, 200000, 128000, "seed"},
-	{"mimo-v2.5-free", []string{"mimo-v2.5", "mimo"}, 200000, 32000, "seed"},
-	{"ling-3.0-flash-free", []string{"ling-3.0-flash", "ling"}, 200000, 32768, "seed"},
-	{"nemotron-3-ultra-free", []string{"nemotron-3-ultra", "nemotron"}, 1000000, 128000, "seed"},
-	{"north-mini-code-free", []string{"north-mini-code", "north-mini"}, 256000, 64000, "seed"},
-	{"laguna-s-2.1-free", []string{"laguna-s-2.1", "laguna"}, 200000, 32768, "seed"},
-	{"longcat-2.0-free", []string{"longcat-2.0", "longcat"}, 200000, 32768, "seed"},
-	{"big-pickle", nil, 200000, 32000, "seed"},
+	{"deepseek-v4-flash-free", []string{"deepseek-v4-flash", "deepseek-v4"}, 200000, 128000, "seed", "", "", "chat"},
+	{"mimo-v2.5-free", []string{"mimo-v2.5", "mimo"}, 200000, 32000, "seed", "", "", "chat"},
+	{"ling-3.0-flash-free", []string{"ling-3.0-flash", "ling"}, 200000, 32768, "seed", "", "", "chat"},
+	{"nemotron-3-ultra-free", []string{"nemotron-3-ultra", "nemotron"}, 1000000, 128000, "seed", "", "", "chat"},
+	{"north-mini-code-free", []string{"north-mini-code", "north-mini"}, 256000, 64000, "seed", "", "", "chat"},
+	{"laguna-s-2.1-free", []string{"laguna-s-2.1", "laguna"}, 200000, 32768, "seed", "", "", "chat"},
+	{"longcat-2.0-free", []string{"longcat-2.0", "longcat"}, 200000, 32768, "seed", "", "", "chat"},
+	{"big-pickle", nil, 200000, 32000, "seed", "", "", "chat"},
 }
 
 var (
@@ -85,12 +89,17 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 	return nil, false
 }
 
-// isZenFreeModel 免费判定: seed 白名单 或 ID 带 -free 后缀
+// isZenFreeModel 免费判定: seed 白名单、ID 带 -free 后缀、
+// 或 models.dev 元数据判定为免费（解决 synced 模型被误判非免费的问题）。
 func isZenFreeModel(m *ZenModel) bool {
 	if m == nil {
 		return false
 	}
-	return m.Source == "seed" || strings.HasSuffix(m.ID, "-free")
+	if m.Source == "seed" || strings.HasSuffix(m.ID, "-free") {
+		return true
+	}
+	// synced 模型查 models.dev 成本元数据
+	return metadataStore.Decide(m.ID).Allowed
 }
 
 // resolveZenFreeModel 只解析免费 zen 模型
@@ -357,13 +366,16 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 	if stream {
 		body["stream"] = true
 	}
-	if model, ok := params["model"].(string); ok {
+	model, _ := params["model"].(string)
+	if model != "" {
 		if m, ok := resolveZenModel(model); ok {
 			body["model"] = m.ID
 		}
 	}
-	delete(body, "reasoning_effort")
-	delete(body, "reasoningEffort")
+	// 借鉴 opencode2api：DeepSeek/Kimi/MiMo 等兼容端点要求工具调用回合带 reasoning 历史。
+	// zen 上游固定走 Chat 协议，按模型/URL 判定是否规范化，而非无条件剥离 reasoning_effort。
+	cfg := getZenConfig()
+	normalizeToolReasoningHistory(ProtocolChat, model, cfg.BaseURL, body)
 	return body
 }
 
@@ -527,6 +539,10 @@ func syncZenModels() (int, error) {
 		return 0, err
 	}
 
+	// 借鉴 opencode2api：拉取 OpenCode 能力目录，填充各模型原生协议。
+	// cline-proxy 的 zen 渠道固定走 Chat 协议，过滤掉原生协议非 chat 的模型。
+	syncZenProtocols()
+
 	zenModelsMu.Lock()
 	defer zenModelsMu.Unlock()
 	added := 0
@@ -542,12 +558,18 @@ func syncZenModels() (int, error) {
 		if _, conflict := zenAliases[id]; conflict {
 			continue
 		}
+		// 过滤：只保留原生协议为 chat 的模型（responses/anthropic 原生协议暂不支持）
+		protocol := zenProtocolFor(id)
+		if protocol != ProtocolChat {
+			continue
+		}
 		// 新模型:默认按 200K 上下文接入,输出按 32K
 		zenModels[id] = &ZenModel{
-			ID:      id,
-			Context: 200000,
-			Output:  32768,
-			Source:  "synced",
+			ID:       id,
+			Context:  200000,
+			Output:   32768,
+			Source:   "synced",
+			Protocol: string(protocol),
 		}
 		added++
 	}
@@ -556,6 +578,8 @@ func syncZenModels() (int, error) {
 
 // startZenModelsRefresher 定时同步 zen 模型列表(默认 10 分钟)
 func startZenModelsRefresher() {
+	// 启动 models.dev 成本元数据刷新（24h 周期），供 isZenFreeModel 判定 synced 模型
+	metadataStore.Start(context.Background())
 	go func() {
 		if _, err := syncZenModels(); err != nil {
 			log.Printf("zen model sync: failed (%v), using seed list", err)
