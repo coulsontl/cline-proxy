@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -244,9 +245,30 @@ func getAccountByID(accountID string) *Account {
 }
 
 // refreshAccountToken 刷新账号 token 并写库。失败标记 expired。
+// isNetworkError 判定错误是否为网络层（DNS/dial/EOF/timeout）而非上游认证拒绝。
+// 网络错误是临时的，不应把账号标 expired。
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, hint := range []string{"lookup ", "dial ", "no such host", "connection", "eof", "timeout", "timed out", "refused", "unreachable", "reset"} {
+		if strings.Contains(msg, hint) {
+			return true
+		}
+	}
+	return false
+}
+
 func refreshAccountToken(acc *Account) error {
 	resp, err := cline.RefreshClineToken(acc.RefreshToken)
 	if err != nil {
+		// 区分网络错误与认证错误：网络抖动（DNS/dial/EOF/timeout）不标 expired，
+		// 保持原状态等下次重试；只有 cline 返回非 2xx（refresh_token 真失效）才永久标 expired。
+		if isNetworkError(err) {
+			log.Printf("token refresh network error (kept %s): %v", acc.Status, err)
+			return fmt.Errorf("token refresh network error: %w", err)
+		}
 		acc.Status = "expired"
 		_, _ = statsDB.Exec(`UPDATE accounts SET status='expired' WHERE account_id=?`, acc.AccountID)
 		return fmt.Errorf("token refresh failed: %w", err)
