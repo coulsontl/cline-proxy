@@ -16,7 +16,6 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
@@ -134,16 +133,11 @@ func buildZenTransport() *http.Transport {
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
-	}
-	t.DialContext = zenDialContext
-	// https 走 HTTP/2 + uTLS Chrome 指纹: 完整浏览器指纹(含 h2),避免 Go 原生指纹被 CF 风控
-	t.RegisterProtocol("https", zenHTTP2Transport())
-	return t
-}
-
-func zenHTTP2Transport() *http2.Transport {
-	return &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		ForceAttemptHTTP2:   false,
+		DialContext:         zenDialContext,
+		// https 走 uTLS Chrome 指纹(规避 Go 原生指纹被 CF 风控)，ALPN 只协商 http/1.1：
+		// 与 cline 上游同理，http2.Transport(h2-only) 在流式场景会出现 200 后 body 不出数据。
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			raw, err := zenDialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
@@ -153,10 +147,21 @@ func zenHTTP2Transport() *http2.Transport {
 				raw.Close()
 				return nil, err
 			}
-			uconn := utls.UClient(raw, &utls.Config{
-				ServerName: host,
-				NextProtos: []string{"h2", "http/1.1"},
-			}, utls.HelloChrome_120)
+			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
+			if err != nil {
+				raw.Close()
+				return nil, err
+			}
+			for _, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+				}
+			}
+			uconn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
+			if err := uconn.ApplyPreset(&spec); err != nil {
+				raw.Close()
+				return nil, err
+			}
 			if err := uconn.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err
@@ -164,6 +169,7 @@ func zenHTTP2Transport() *http2.Transport {
 			return uconn, nil
 		},
 	}
+	return t
 }
 
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
