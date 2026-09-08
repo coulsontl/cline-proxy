@@ -43,10 +43,25 @@ func newUTLSTransport() *http.Transport {
 				raw.Close()
 				return nil, err
 			}
-			uconn := utls.UClient(raw, &utls.Config{
-				ServerName: host,
-				NextProtos: []string{"http/1.1"},
-			}, utls.HelloChrome_120)
+			// Chrome 预设自带 ALPN(h2+http/1.1)，Config.NextProtos 会被预设覆盖、
+			// 放任协商出 h2 时标准 http.Transport 不讲 h2，会把 h2 SETTINGS 帧当
+			// 乱码报 "malformed HTTP response"。这里取出 Chrome spec，把 ALPN 改成
+			// 只 http/1.1，再以 HelloCustom 应用，确保协商 HTTP/1.1，SSE chunked 最稳。
+			spec, err := utls.UTLSIdToSpec(utls.HelloChrome_120)
+			if err != nil {
+				raw.Close()
+				return nil, err
+			}
+			for _, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"}
+				}
+			}
+			uconn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
+			if err := uconn.ApplyPreset(&spec); err != nil {
+				raw.Close()
+				return nil, err
+			}
 			if err := uconn.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err
