@@ -378,6 +378,25 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 
 <div class="section">
+  <div class="section-title">🌐 Cline 上游代理</div>
+  <div class="section-body">
+    <div class="hint" style="margin-bottom:10px">Cline 上游(auth / 转发 / 模型元数据等)出站代理。列表为空时回落到 HTTP_PROXY/HTTPS_PROXY 环境变量,再为空则直连。https 仍走 uTLS Chrome 指纹,穿越代理不丢指纹。</div>
+    <div class="form-row">
+      <div class="field"><label>代理策略</label>
+        <select id="clineStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>代理列表</label>
+        <textarea id="clineProxies" rows="3" placeholder="每行一个: http://user:pass@host:port 或 socks5://host:port&#10;留空则使用 HTTP_PROXY/HTTPS_PROXY 环境变量"></textarea>
+      </div>
+    </div>
+    <div class="form-actions"><button class="btn btn-primary" onclick="saveClineConfig()">💾 保存配置</button></div>
+    <div id="clineProxyHint" class="hint" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div class="section">
   <div class="section-title">📨 请求头配置（模拟 Cline CLI 发出）</div>
   <div class="section-body">
     <div class="table-wrap">
@@ -581,7 +600,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     _('tab-' + el.dataset.tab).style.display = 'block';
     if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
-    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
+    if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); loadClineConfig(); }
     if (el.dataset.tab === 'logs') loadLogs();
     if (el.dataset.tab === 'opencode') { loadOcConfig(); loadOcModels(); loadOcStats(); }
   });
@@ -1066,6 +1085,32 @@ async function loadConfig() {
   } catch (e) { /* ignore */ }
 }
 
+// ========== Cline 上游代理配置 ==========
+async function loadClineConfig() {
+  try {
+    const d = await api('GET', '/cline/config');
+    const c = d.data;
+    _('clineProxies').value = (c.proxies || []).join('\n');
+    _('clineStrategy').value = c.proxyStrategy || 'round_robin';
+    const hint = _('clineProxyHint');
+    hint.textContent = (c.proxies && c.proxies.length)
+      ? '当前: 使用配置代理列表(' + c.proxies.length + ' 条)'
+      : '当前: 列表为空,回落 HTTP_PROXY/HTTPS_PROXY 环境变量';
+  } catch (e) { /* ignore */ }
+}
+
+async function saveClineConfig() {
+  const proxies = _('clineProxies').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const PROXY_RE = /^(https?|socks5h?):\/\/[^\s]+:\d+/;
+  const bad = proxies.find(p => !PROXY_RE.test(p));
+  if (bad) { toast('代理格式无效: ' + bad + '（需 http(s)://host:port 或 socks5://host:port）', 'error'); return; }
+  try {
+    const d = await api('POST', '/cline/config/update', { proxies, proxyStrategy: _('clineStrategy').value });
+    toast(d.message || 'Cline 代理配置已保存', 'success');
+    loadClineConfig();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
 // ========== opencode 免费模型 ==========
 async function loadOcConfig() {
   try {
@@ -1169,6 +1214,7 @@ loadAccounts();
 loadKeys();
 loadModels();
 loadConfig();
+loadClineConfig();
 setInterval(() => { loadStats(); }, 10000);
 setInterval(() => { loadOcStats(); }, 15000);
 setInterval(() => { if (_('tab-logs').style.display !== 'none') loadLogs(); }, 8000);

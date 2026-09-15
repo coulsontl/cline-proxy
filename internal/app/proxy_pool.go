@@ -1,22 +1,17 @@
 package app
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
-	"encoding/base64"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"cline-go-proxy/internal/kit"
+
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/proxy"
 )
 
 var (
@@ -173,102 +168,13 @@ func buildZenTransport() *http.Transport {
 }
 
 func zenDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	p, _ := pickZenProxy()
-	if p == "" {
-		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-		return d.DialContext(ctx, network, addr)
+	// 优先级:zen config 代理池 > HTTP_PROXY/HTTPS_PROXY 环境变量 > 直连
+	if p, _ := pickZenProxy(); p != "" {
+		return kit.DialViaProxy(ctx, p, network, addr)
 	}
-	return dialViaProxy(ctx, p, network, addr)
-}
-
-// dialViaProxy 统一拨号:http/https 走 CONNECT,socks5 走 SOCKS5 握手
-func dialViaProxy(ctx context.Context, raw, network, addr string) (net.Conn, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("bad proxy url: %w", err)
+	if envP := kit.EnvProxyURL(addr); envP != "" {
+		return kit.DialViaProxy(ctx, envP, network, addr)
 	}
-	switch u.Scheme {
-	case "http", "https":
-		return dialHTTPProxy(ctx, u, network, addr)
-	case "socks5", "socks5h":
-		auth := &proxy.Auth{}
-		if u.User != nil {
-			auth.User = u.User.Username()
-			auth.Password, _ = u.User.Password()
-		}
-		d, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
-		if err != nil {
-			return nil, err
-		}
-		type ctxDialer interface {
-			DialContext(context.Context, string, string) (net.Conn, error)
-		}
-		if cd, ok := d.(ctxDialer); ok {
-			return cd.DialContext(ctx, network, addr)
-		}
-		// 旧接口无 ctx:包装
-		type result struct {
-			c   net.Conn
-			err error
-		}
-		ch := make(chan result, 1)
-		go func() {
-			c, err := d.Dial(network, addr)
-			ch <- result{c, err}
-		}()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case r := <-ch:
-			return r.c, r.err
-		}
-	default:
-		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
-	}
-}
-
-// dialHTTPProxy 通过 http(s) 代理建立 CONNECT 隧道
-func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	rawConn, err := d.DialContext(ctx, "tcp", u.Host)
-	if err != nil {
-		return nil, err
-	}
-	if u.Scheme == "https" {
-		tlsConn := tls.Client(rawConn, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()})
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			rawConn.Close()
-			return nil, err
-		}
-		rawConn = tlsConn
-	}
-
-	req := &http.Request{
-		Method: http.MethodConnect,
-		URL:    &url.URL{Opaque: addr},
-		Host:   addr,
-		Header: make(http.Header),
-	}
-	if u.User != nil {
-		cred := base64.StdEncoding.EncodeToString([]byte(u.User.String()))
-		req.Header.Set("Proxy-Authorization", "Basic "+cred)
-	}
-	if err := req.Write(rawConn); err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-
-	br := bufio.NewReader(rawConn)
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		rawConn.Close()
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("proxy CONNECT %s: %s %s", u.Host, resp.Status, strings.TrimSpace(string(b)))
-	}
-	return rawConn, nil
+	return d.DialContext(ctx, network, addr)
 }

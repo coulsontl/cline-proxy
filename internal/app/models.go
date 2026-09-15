@@ -2,6 +2,7 @@ package app
 
 import (
 	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -114,7 +115,7 @@ func syncRecommendedModels() (int, error) {
 	req.Header = clineHeaders(token, "")
 	req.Header.Set("X-Task-ID", fmt.Sprintf("sess_sync_%d", time.Now().UnixMilli()))
 
-	client := &http.Client{Timeout: modelsSyncTimeout}
+	client := kit.NewProxiedClient(modelsSyncTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err

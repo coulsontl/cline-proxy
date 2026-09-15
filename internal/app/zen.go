@@ -520,7 +520,7 @@ func syncZenModels() (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Key)
-	client := &http.Client{Timeout: 25 * time.Second}
+	client := &http.Client{Timeout: 25 * time.Second, Transport: buildZenTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err

@@ -87,6 +87,8 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
 	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
 	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
+	mux.HandleFunc("/admin/api/cline/config", corsHandler(handleClineConfig))
+	mux.HandleFunc("/admin/api/cline/config/update", corsHandler(handleClineConfigUpdate))
 	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
 	})
@@ -736,7 +738,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	req.Header = clineHeaders(token, sessionID)
 
-	resp, err := kit.HTTPClient.Do(req)
+	resp, err := kit.HTTPClient().Do(req)
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)

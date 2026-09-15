@@ -599,7 +599,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
 		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := kit.HTTPClient.Do(req)
+	resp, err := kit.HTTPClient().Do(req)
 	if err != nil {
 		// 网络错误：临时短冷却 5 分钟
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
@@ -613,7 +613,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		if err := refreshAccountToken(acc); err == nil {
 			token = acc.AccessToken
 			req.Header = clineHeaders(token, sessionID)
-			resp, err = kit.HTTPClient.Do(req)
+			resp, err = kit.HTTPClient().Do(req)
 			if err != nil {
 				return nil, acc, ctx, fmt.Errorf("upstream retry: %w", err)
 			}

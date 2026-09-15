@@ -109,7 +109,7 @@ func (store *modelMetadataStore) Refresh(ctx context.Context) error {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/1.18.21 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version()))
-	resp, err := kit.HTTPClient.Do(req)
+	resp, err := kit.HTTPClient().Do(req)
 	if err != nil {
 		return store.recordError(err)
 	}
