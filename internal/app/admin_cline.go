@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 )
@@ -18,6 +19,8 @@ func handleClineConfig(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"proxies":       cfg.Proxies,
 		"proxyStrategy": cfg.ProxyStrategy,
+		"retryCount":    clineRetryCount(),
+		"maxRetryCount": maxClineRetryCount,
 	}})
 }
 
@@ -38,6 +41,7 @@ func handleClineConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	var patch struct {
 		Proxies       []string `json:"proxies"`
 		ProxyStrategy *string  `json:"proxyStrategy"`
+		RetryCount    *int     `json:"retryCount"`
 	}
 	if err := json.Unmarshal(body, &patch); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON: " + err.Error()})
@@ -49,9 +53,20 @@ func handleClineConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if patch.RetryCount != nil {
+		if *patch.RetryCount < 0 || *patch.RetryCount > maxClineRetryCount {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("retryCount 必须在 0-%d 之间", maxClineRetryCount)})
+			return
+		}
+	}
+
 	cur := getClineConfig()
 	next := *cur
 	next.Proxies = patch.Proxies
+	if patch.RetryCount != nil {
+		retry := *patch.RetryCount
+		next.RetryCount = &retry
+	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		switch *patch.ProxyStrategy {
 		case "round_robin", "random", "fill":
@@ -65,5 +80,6 @@ func handleClineConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Cline 代理配置已保存", Data: map[string]any{
 		"proxies":       next.Proxies,
 		"proxyStrategy": next.ProxyStrategy,
+		"retryCount":    clineRetryCount(),
 	}})
 }

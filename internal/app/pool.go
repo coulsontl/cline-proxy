@@ -291,6 +291,13 @@ func refreshAccountToken(acc *Account) error {
 
 // pickAccount 按策略选号，冷却到期账号自动恢复。
 func pickAccount() *Account {
+	return pickAccountExcluding(nil)
+}
+
+// pickAccountExcluding 选号时跳过 excludeAccountIDs（空回/上游错误重试时避免
+// 选中已试过的号）。候选全被排除时退回原候选集——宁可同号再试一次，
+// 也好过直接失败。注意 loadPool 每次返回全新副本，排除只能按 AccountID 比较。
+func pickAccountExcluding(excludeAccountIDs []string) *Account {
 	if statsDB == nil {
 		return nil
 	}
@@ -314,20 +321,66 @@ func pickAccount() *Account {
 	var acc *Account
 	switch cfg.Strategy {
 	case "fill":
-		acc = active[0]
+		acc = firstNonExcluded(active, excludeAccountIDs)
 	case "random":
-		n := time.Now().UnixNano() % int64(len(active))
-		acc = active[n]
+		candidates := nonExcludedAccounts(active, excludeAccountIDs)
+		n := time.Now().UnixNano() % int64(len(candidates))
+		acc = candidates[n]
 	default: // round_robin
-		idx := p.CurrentIdx
-		if idx >= len(active) {
-			idx = 0
+		start := p.CurrentIdx
+		if start < 0 || start >= len(active) {
+			start = 0
 		}
-		acc = active[idx]
-		next := (idx + 1) % len(active)
+		// 从当前游标向后（环形）找第一个未被排除的账号，游标按实际选中的位置推进，
+		// 这样被排除的号不会把轮询卡住。
+		picked := start
+		for i := 0; i < len(active); i++ {
+			pos := (start + i) % len(active)
+			if isExcludedAccount(active[pos], excludeAccountIDs) {
+				continue
+			}
+			picked = pos
+			break
+		}
+		acc = active[picked]
+		next := (picked + 1) % len(active)
 		_, _ = statsDBExec(`UPDATE proxy_state SET current_idx=? WHERE id=1`, next)
 	}
 	return acc
+}
+
+func isExcludedAccount(a *Account, excludeAccountIDs []string) bool {
+	if a == nil {
+		return true
+	}
+	for _, id := range excludeAccountIDs {
+		if id != "" && a.AccountID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// nonExcludedAccounts 去掉已试过的账号；若去掉后为空则退回全量（只剩一个账号时）。
+func nonExcludedAccounts(active []*Account, excludeAccountIDs []string) []*Account {
+	if len(excludeAccountIDs) == 0 {
+		return active
+	}
+	out := make([]*Account, 0, len(active))
+	for _, a := range active {
+		if !isExcludedAccount(a, excludeAccountIDs) {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return active
+	}
+	return out
+}
+
+// firstNonExcluded 取第一个未被排除的账号（fill 策略用）。
+func firstNonExcluded(active []*Account, excludeAccountIDs []string) *Account {
+	return nonExcludedAccounts(active, excludeAccountIDs)[0]
 }
 
 // markCooldown 429 时调用：失败计数递增，按指数退避设定冷却截止时间。

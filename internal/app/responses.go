@@ -502,7 +502,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, ctx, err := callClineAPI(chat, stream)
+	up, acc, ctx, err := callClineAPI(chat, stream, nil)
 	ctx.apiFormat = "openai"
 	if err != nil {
 		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
@@ -525,7 +525,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stream {
-		out, err := collectStreamResponse(up)
+		out, _, err := collectStreamResponse(up)
 		if err != nil {
 			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

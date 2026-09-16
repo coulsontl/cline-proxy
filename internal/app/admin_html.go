@@ -385,7 +385,11 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>代理策略</label>
         <select id="clineStrategy"><option value="round_robin">轮询 round_robin</option><option value="random">随机 random</option><option value="fill">固定 fill</option></select>
       </div>
+      <div class="field"><label>空回/错误重试次数</label>
+        <input type="number" id="clineRetryCount" min="0" max="5" step="1" placeholder="1">
+      </div>
     </div>
+    <div class="hint" style="margin-bottom:10px">上游返回空内容（HTTP 200 但无 content/tool_calls/reasoning），或 5xx/网络错误时，换一个账号重试的次数。0 = 不重试；默认 1（即失败后再试一次，仍失败返回 502）。</div>
     <div class="form-row">
       <div class="field"><label>代理列表</label>
         <textarea id="clineProxies" rows="3" placeholder="每行一个: http://user:pass@host:port 或 socks5://host:port&#10;留空则使用 HTTP_PROXY/HTTPS_PROXY 环境变量"></textarea>
@@ -1092,6 +1096,8 @@ async function loadClineConfig() {
     const c = d.data;
     _('clineProxies').value = (c.proxies || []).join('\n');
     _('clineStrategy').value = c.proxyStrategy || 'round_robin';
+    _('clineRetryCount').max = (c.maxRetryCount != null ? c.maxRetryCount : 5);
+    _('clineRetryCount').value = (c.retryCount != null ? c.retryCount : 1);
     const hint = _('clineProxyHint');
     hint.textContent = (c.proxies && c.proxies.length)
       ? '当前: 使用配置代理列表(' + c.proxies.length + ' 条)'
@@ -1104,8 +1110,13 @@ async function saveClineConfig() {
   const PROXY_RE = /^(https?|socks5h?):\/\/[^\s]+:\d+/;
   const bad = proxies.find(p => !PROXY_RE.test(p));
   if (bad) { toast('代理格式无效: ' + bad + '（需 http(s)://host:port 或 socks5://host:port）', 'error'); return; }
+  const retryRaw = _('clineRetryCount').value.trim();
+  const retryCount = retryRaw === '' ? null : Number(retryRaw);
+  if (retryCount !== null && (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5)) {
+    toast('重试次数需为 0-5 的整数', 'error'); return;
+  }
   try {
-    const d = await api('POST', '/cline/config/update', { proxies, proxyStrategy: _('clineStrategy').value });
+    const d = await api('POST', '/cline/config/update', { proxies, proxyStrategy: _('clineStrategy').value, retryCount });
     toast(d.message || 'Cline 代理配置已保存', 'success');
     loadClineConfig();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }

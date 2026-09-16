@@ -122,9 +122,12 @@ func TestCollectStreamResponseAggregatesInterleavedToolCallsByIndex(t *testing.T
 	}, "\n")
 	response := &http.Response{Body: io.NopCloser(strings.NewReader(sse))}
 
-	collected, err := collectStreamResponse(response)
+	collected, hasContent, err := collectStreamResponse(response)
 	if err != nil {
 		t.Fatalf("collect stream response: %v", err)
+	}
+	if !hasContent {
+		t.Fatal("expected aggregated stream to report content")
 	}
 	toolCalls, ok := getNested(collected, "choices", 0, "message", "tool_calls").([]any)
 	if !ok {
@@ -179,7 +182,7 @@ func TestCollectStreamResponseReturnsReadError(t *testing.T) {
 		data: "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
 	}}}
 
-	_, err := collectStreamResponse(response)
+	_, _, err := collectStreamResponse(response)
 	if !errors.Is(err, errInterruptedStream) {
 		t.Fatalf("expected interrupted stream error, got %v", err)
 	}

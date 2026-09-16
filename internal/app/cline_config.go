@@ -17,12 +17,38 @@ import (
 type clineConfigData struct {
 	Proxies       []string `json:"proxies"`       // http(s)/socks5 代理,轮询出口
 	ProxyStrategy string   `json:"proxyStrategy"` // round_robin / random / fill
+	// RetryCount 是空回/上游 5xx/网络错误时换号重试的次数（0 = 不重试）。
+	// 用指针区分「未配置」（nil → 默认值）与「显式设为 0」。
+	RetryCount *int `json:"retryCount,omitempty"`
 }
 
+const (
+	defaultClineRetryCount = 1 // 默认重试一次
+	maxClineRetryCount     = 5 // 上限，避免设置页填出离谱值把一次请求拉爆
+)
+
 func defaultClineConfig() *clineConfigData {
+	retry := defaultClineRetryCount
 	return &clineConfigData{
 		ProxyStrategy: "round_robin",
+		RetryCount:    &retry,
 	}
+}
+
+// clineRetryCount 返回生效的重试次数（未配置或越界时收敛到合法范围）。
+func clineRetryCount() int {
+	cfg := getClineConfig()
+	if cfg == nil || cfg.RetryCount == nil {
+		return defaultClineRetryCount
+	}
+	n := *cfg.RetryCount
+	if n < 0 {
+		n = 0
+	}
+	if n > maxClineRetryCount {
+		n = maxClineRetryCount
+	}
+	return n
 }
 
 var (
