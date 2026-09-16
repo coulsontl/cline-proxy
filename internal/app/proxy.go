@@ -727,8 +727,13 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *r
 				if line != "" {
 					w.Write([]byte(line + "\n"))
 				}
+				break
 			}
-			break
+			// 上游中途断流：记录真实原因，否则只剩一个 200 + 空 body，
+			// 客户端只能报笼统的 "stream ended without terminal event"。
+			log.Printf("  upstream stream aborted: %v", err)
+			insertRequestRecord(ctx, u, false, http.StatusBadGateway, "upstream stream aborted: "+err.Error())
+			return
 		}
 
 		line = strings.TrimRight(line, "\r\n")

@@ -123,6 +123,24 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// Flush 转发到底层 ResponseWriter。包装器只内嵌 ResponseWriter 接口不会提升
+// Flush 方法，缺了它 statusWriter 就不再实现 http.Flusher：SSE 处理器里的
+// w.(http.Flusher) 断言失败，会直接返回空的 200 响应体，客户端报
+// "stream ended without terminal event"。
+func (w *statusWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap 暴露底层 ResponseWriter，供 http.NewResponseController 透传 Flush 等能力。
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // requestLogMiddleware 记录所有进入代理的请求（API 调用与对话历史）。
 func requestLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
