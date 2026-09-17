@@ -220,21 +220,7 @@ func chatToResponses(chat map[string]any) map[string]any {
 	resp["output"] = outputs
 	resp["output_text"] = outputText.String()
 	if u, ok := chat["usage"].(map[string]any); ok {
-		details := map[string]any{}
-		if pd, ok := u["prompt_tokens_details"].(map[string]any); ok {
-			details["cached_tokens"] = pd["cached_tokens"]
-		}
-		od := map[string]any{}
-		if rd, ok := u["reasoning_tokens"]; ok {
-			od["reasoning_tokens"] = rd
-		}
-		resp["usage"] = map[string]any{
-			"input_tokens":          u["prompt_tokens"],
-			"input_tokens_details":  details,
-			"output_tokens":         u["completion_tokens"],
-			"output_tokens_details": od,
-			"total_tokens":          u["total_tokens"],
-		}
+		resp["usage"] = openAIUsageToResponses(u)
 	}
 	return resp
 }
@@ -261,7 +247,63 @@ func (s *responsesSSEWriter) event(event string, data any) {
 	}
 }
 
-// chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
+// respToolCall 是一条流式 tool_call 的累积状态。
+// 之前用全局 curCallName/curArgs：多个工具调用会互相顶掉（名字取最后一个、
+// 参数拼在一起），item id 也只用名字拼（同名调用撞 id）。
+type respToolCall struct {
+	itemID   string
+	callID   string
+	name     string
+	args     strings.Builder
+	outIndex int
+	added    bool
+}
+
+// usageInt 取 usage 字段，缺失时给 0（避免 JSON 里出现 null）。
+func usageInt(u map[string]any, key string) any {
+	if v, ok := u[key]; ok {
+		return v
+	}
+	return 0
+}
+
+// openAIUsageToResponses 把 chat.completions 的 usage 转成 Responses 的 usage 形状。
+// 非流式与流式的 response.completed 共用，避免两边口径不一致（流式那边以前恒为 0）。
+func openAIUsageToResponses(u map[string]any) map[string]any {
+	details := map[string]any{}
+	if pd, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		if cached, ok := pd["cached_tokens"]; ok {
+			details["cached_tokens"] = cached
+		}
+	}
+	od := map[string]any{}
+	if rd, ok := u["reasoning_tokens"]; ok {
+		od["reasoning_tokens"] = rd
+	}
+	if cd, ok := u["completion_tokens_details"].(map[string]any); ok {
+		if rd, ok := cd["reasoning_tokens"]; ok {
+			od["reasoning_tokens"] = rd
+		}
+	}
+	return map[string]any{
+		"input_tokens":          usageInt(u, "prompt_tokens"),
+		"input_tokens_details":  details,
+		"output_tokens":         usageInt(u, "completion_tokens"),
+		"output_tokens_details": od,
+		"total_tokens":          usageInt(u, "total_tokens"),
+	}
+}
+
+// callItemID 生成 function_call 的 item id：优先用上游 call id（唯一），
+// 缺失时退回累积下标，避免同名工具调用撞 id。
+func callItemID(call *respToolCall, callIndex int) string {
+	if call.callID != "" {
+		return "fc_" + call.callID
+	}
+	return fmt.Sprintf("fc_%d", callIndex)
+}
+
+// chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流。
 // 返回 nil 表示上游流正常结束；返回非 nil 表示上游中途断流（已发 response.failed），
 // 调用方据此把这次请求记为失败而不是成功。
 func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) error {
@@ -281,11 +323,23 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	})
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
-	textEmitted := false
-	callEmitted := false
-	var curCallID, curCallName string
-	var curArgs strings.Builder
-	var outText strings.Builder
+	// output_index 按「项出现的先后」递增分配（协议要求单调）：文本项与每个
+	// function_call 各占一个，不再把 function_call 写死成 1。
+	var (
+		nextIndex int
+		textIndex = -1
+		outText   strings.Builder
+		lastUsage map[string]any
+		calls     = map[int]*respToolCall{}
+		callOrder []int
+	)
+
+	textOutputIndex := func() int {
+		if textIndex >= 0 {
+			return textIndex
+		}
+		return 0
+	}
 
 	reader := bufio.NewReader(upstream.Body)
 	var streamErr error
@@ -296,10 +350,16 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			if strings.HasPrefix(line, "data:") {
 				payload := strings.TrimSpace(line[5:])
 				if payload == "" || payload == "[DONE]" {
+					if err != nil {
+						break
+					}
 					continue
 				}
 				var obj map[string]any
 				if json.Unmarshal([]byte(payload), &obj) != nil {
+					if err != nil {
+						break
+					}
 					continue
 				}
 				if data, ok := obj["data"]; ok {
@@ -310,10 +370,11 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if m, ok := obj["model"].(string); ok && m != "" {
 					model = m
 				}
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+					if onUsage != nil {
 						onUsage(u)
 					}
+					lastUsage = u
 				}
 				choices, _ := obj["choices"].([]any)
 				if len(choices) == 0 {
@@ -329,72 +390,94 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				}
 				// 文本
 				if c, ok := delta["content"].(string); ok && c != "" {
-					if !textEmitted {
-						textEmitted = true
+					if textIndex < 0 {
+						textIndex = nextIndex
+						nextIndex++
 						s.event("response.output_item.added", map[string]any{
-							"type":       "response.output_item.added",
-							"output_index": 0,
-							"item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+							"type":         "response.output_item.added",
+							"output_index": textIndex,
+							"item":         map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
 						})
 						s.event("response.content_part.added", map[string]any{
-							"type": "response.content_part.added",
-							"item_id": s.msgID,
-							"output_index": 0,
+							"type":          "response.content_part.added",
+							"item_id":       s.msgID,
+							"output_index":  textIndex,
 							"content_index": 0,
-							"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+							"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 						})
 					}
 					outText.WriteString(c)
 					s.event("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.output_text.delta",
+						"item_id":       s.msgID,
+						"output_index":  textIndex,
 						"content_index": 0,
-						"delta": c,
+						"delta":         c,
 					})
 				}
 				// 推理
 				if r, ok := delta["reasoning_content"].(string); ok && r != "" {
 					s.event("response.reasoning_summary_text.delta", map[string]any{
-						"type": "response.reasoning_summary_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.reasoning_summary_text.delta",
+						"item_id":       s.msgID,
+						"output_index":  textOutputIndex(),
 						"content_index": 0,
-						"delta": r,
+						"delta":         r,
 					})
 				}
-				// 工具调用
+				// 工具调用：按上游给的 index 分别累积，互不干扰
 				if tc, ok := delta["tool_calls"].([]any); ok {
-					for _, c := range tc {
+					for position, c := range tc {
 						cm, ok := c.(map[string]any)
 						if !ok {
 							continue
 						}
-						if id, ok := cm["id"].(string); ok && id != "" {
-							curCallID = id
+						callIndex := position
+						if f, ok := cm["index"].(float64); ok {
+							callIndex = int(f)
 						}
-						fn, _ := cm["function"].(map[string]any)
-						if fn != nil {
+						call := calls[callIndex]
+						if call == nil {
+							call = &respToolCall{outIndex: nextIndex}
+							nextIndex++
+							calls[callIndex] = call
+							callOrder = append(callOrder, callIndex)
+						}
+						if id, ok := cm["id"].(string); ok && id != "" {
+							call.callID = id
+						}
+						argChunk := ""
+						if fn, ok := cm["function"].(map[string]any); ok {
 							if n, ok := fn["name"].(string); ok && n != "" {
-								curCallName = n
+								call.name = n
 							}
 							if a, ok := fn["arguments"].(string); ok && a != "" {
-								curArgs.WriteString(a)
+								argChunk = a
+								call.args.WriteString(a)
 							}
 						}
-						if !callEmitted && curCallName != "" {
-							callEmitted = true
+						if !call.added {
+							call.added = true
+							call.itemID = callItemID(call, callIndex)
 							s.event("response.output_item.added", map[string]any{
-								"type": "response.output_item.added",
-								"output_index": 1,
+								"type":         "response.output_item.added",
+								"output_index": call.outIndex,
 								"item": map[string]any{
-									"type": "function_call",
-									"id":   "fc_" + curCallName,
-									"call_id": curCallID,
-									"name": curCallName,
+									"type":      "function_call",
+									"id":        call.itemID,
+									"call_id":   call.callID,
+									"name":      call.name,
 									"arguments": "",
-									"status": "in_progress",
+									"status":    "in_progress",
 								},
+							})
+						}
+						if argChunk != "" {
+							s.event("response.function_call_arguments.delta", map[string]any{
+								"type":         "response.function_call_arguments.delta",
+								"item_id":      call.itemID,
+								"output_index": call.outIndex,
+								"delta":        argChunk,
 							})
 						}
 					}
@@ -430,16 +513,44 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		return streamErr
 	}
 
-	// 收尾
-	if textEmitted {
-		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "text": outText.String()})
-		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
+	// 收尾：文本项
+	output := []any{}
+	if textIndex >= 0 {
+		messageItem := map[string]any{
+			"id": s.msgID, "type": "message", "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}},
+		}
+		output = append(output, messageItem)
+		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": textIndex, "content_index": 0, "text": outText.String()})
+		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": textIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textIndex, "item": messageItem})
 	}
-	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+	// 收尾：每个工具调用各一份 done（以前只有一个，且参数是所有调用拼在一起的）
+	for _, callIndex := range callOrder {
+		call := calls[callIndex]
+		args := call.args.String()
+		if !call.added {
+			// 上游连名字都没给就结束：补一个 added，别让客户端只收到 done
+			call.itemID = callItemID(call, callIndex)
+			call.added = true
+			s.event("response.output_item.added", map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": call.outIndex,
+				"item": map[string]any{
+					"type": "function_call", "id": call.itemID, "call_id": call.callID,
+					"name": call.name, "arguments": "", "status": "in_progress",
+				},
+			})
+		}
+		callItem := map[string]any{
+			"type": "function_call", "id": call.itemID, "call_id": call.callID,
+			"name": call.name, "arguments": args, "status": "completed",
+		}
+		output = append(output, callItem)
+		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": call.itemID, "output_index": call.outIndex, "arguments": args})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": call.outIndex, "item": callItem})
 	}
+
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
@@ -448,9 +559,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"created_at":  time.Now().Unix(),
 			"status":      "completed",
 			"model":       model,
-			"output":      []any{},
+			"output":      output,
 			"output_text": outText.String(),
-			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+			"usage":       openAIUsageToResponses(lastUsage),
 		},
 	})
 	return nil
