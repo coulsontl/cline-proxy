@@ -38,6 +38,7 @@ type requestContext struct {
 	isStream     bool
 	startAt      time.Time
 	statusCode   int // 200 成功；非 200 错误由 callClineAPI 填充；网络错误留 0
+	attempts     int // 这次客户端请求一共向上游发起了几次（含换号重试）；0 = 未设置按 1 记
 }
 
 // tokenUsage 保存从响应中解析出的 token 消耗。
@@ -142,6 +143,8 @@ func InitStats() error {
 		`ALTER TABLE accounts ADD COLUMN tokens_total INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN tokens_today INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN tokens_date TEXT NOT NULL DEFAULT ''`,
+		// 换号重试可见性：一次客户端请求对应几行里的 attempts
+		`ALTER TABLE request_log ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1`,
 	}
 	for _, s := range migrateStmts {
 		if _, err := d.Exec(s); err != nil {
@@ -168,17 +171,21 @@ func insertRequestRecord(ctx *requestContext, u tokenUsage, success bool, status
 	if email == "" {
 		email = "no_account"
 	}
+	attempts := ctx.attempts
+	if attempts < 1 {
+		attempts = 1
+	}
 	dur := time.Since(ctx.startAt).Milliseconds()
 	_, _ = statsDB.Exec(
 		`INSERT INTO request_log
   (created_at, api_format, account_email, model, is_stream,
    success, status_code, prompt_tokens, completion_tokens,
-   total_tokens, error_message, duration_ms)
-  VALUES (datetime('now','localtime'),?,?,?,?,?,?,?,?,?,?,?)`,
+   total_tokens, error_message, duration_ms, attempts)
+  VALUES (datetime('now','localtime'),?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ctx.apiFormat, email, ctx.model, boolToInt(ctx.isStream),
 		boolToInt(success), statusCode,
 		u.promptTokens, u.completionTokens, u.totalTokens,
-		kit.Truncate(errMsg, 2000), dur,
+		kit.Truncate(errMsg, 2000), dur, attempts,
 	)
 }
 
@@ -254,6 +261,7 @@ type errorRow struct {
 	AccountEmail string `json:"account_email"`
 	Model        string `json:"model"`
 	StatusCode   int    `json:"status_code"`
+	Attempts     int    `json:"attempts"` // >1 表示这次请求换过号（第几次才算失败）
 	ErrorMessage string `json:"error_message"`
 }
 
@@ -343,7 +351,7 @@ func queryByModel(cutoff time.Time) ([]modelStat, error) {
 
 func queryErrors(cutoff time.Time, limit, offset int) ([]errorRow, error) {
 	rows, err := statsDB.Query(
-		`SELECT id, created_at, account_email, model, status_code, error_message
+		`SELECT id, created_at, account_email, model, status_code, attempts, error_message
 		 FROM request_log WHERE success=0 AND created_at >= ?
 		 ORDER BY id DESC LIMIT ? OFFSET ?`,
 		cutoff.Format("2006-01-02 15:04:05"), limit, offset,
@@ -355,7 +363,7 @@ func queryErrors(cutoff time.Time, limit, offset int) ([]errorRow, error) {
 	var out []errorRow
 	for rows.Next() {
 		var e errorRow
-		if err := rows.Scan(&e.ID, &e.CreatedAt, &e.AccountEmail, &e.Model, &e.StatusCode, &e.ErrorMessage); err != nil {
+		if err := rows.Scan(&e.ID, &e.CreatedAt, &e.AccountEmail, &e.Model, &e.StatusCode, &e.Attempts, &e.ErrorMessage); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

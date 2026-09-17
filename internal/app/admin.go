@@ -47,6 +47,7 @@ func writeAPI(w http.ResponseWriter, status int, resp apiResponse) {
 
 func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/", adminStaticHandler)
+	mux.HandleFunc("/admin/api/version", corsHandler(handleVersion))
 	mux.HandleFunc("/admin/api/accounts", corsHandler(handleAdminAccounts))
 	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
 	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
@@ -936,7 +937,7 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"address":      address,
 		"strategy":     cfg.Strategy,
-		"version":      "go-1.1",
+		"version":      Version, // 构建时注入的 git sha（旧值是写死的 "go-1.1"，看不出部署版本）
 		"poolPath":     statsPath,
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,

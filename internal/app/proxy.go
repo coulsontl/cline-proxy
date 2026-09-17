@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -101,7 +102,7 @@ func StartProxy(host string, port int) error {
 	mux.HandleFunc("/v1/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
 		info := map[string]any{
 			"status":         "ok",
-			"version":        "go-1.1",
+			"version":        Version, // 构建时注入的 git sha，便于确认线上部署
 			"activeAccounts": activeCount,
 		}
 		writeJSON(w, http.StatusOK, info)
@@ -109,7 +110,7 @@ func StartProxy(host string, port int) error {
 	mux.HandleFunc("/health", corsHandler(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":         "ok",
-			"version":        "go-1.1",
+			"version":        Version,
 			"activeAccounts": activeCount,
 		})
 	}))
@@ -310,17 +311,20 @@ func StartProxy(host string, port int) error {
 	return server.ListenAndServe()
 }
 
-// initLogFile 将日志同时输出到控制台与 cline-proxy.log（追加模式），
-// 控制台窗口滚动内容有限，文件可完整保留所有日志。
+// initLogFile 将日志同时输出到控制台与 cline-proxy.log。
+// 控制台窗口滚动内容有限，文件可完整保留所有日志；文件按大小轮转
+// （cline-proxy.log.1/.2/...，见 rotatingWriter），避免长期运行把磁盘写满。
 func initLogFile() {
 	path := kit.ResolveDataPath("cline-proxy.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	maxBytes, keep := logSizeSettings()
+	rw, err := newRotatingWriter(path, maxBytes, keep)
 	if err != nil {
 		log.Printf("  open log file failed: %v", err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
-	log.Printf("========== proxy started, log file: %s ==========", path)
+	log.SetOutput(io.MultiWriter(os.Stderr, rw))
+	log.Printf("========== proxy started, log file: %s (rotate at %dMB, keep %d) ==========",
+		path, maxBytes>>20, keep)
 }
 
 func corsHandler(h http.HandlerFunc) http.HandlerFunc {
@@ -533,6 +537,7 @@ func serveClineChat(w http.ResponseWriter, params map[string]any, isStream, upst
 	for attempt := 0; attempt <= retries; attempt++ {
 		resp, acc, ctx, err := call(params, upstreamStream, tried)
 		ctx.apiFormat = "openai"
+		ctx.attempts = attempt + 1
 		if err != nil {
 			if attempt < retries && isRetryableClineError(err, ctx) {
 				log.Printf("  retry %d/%d after upstream error (account %s): %v",
@@ -541,11 +546,7 @@ func serveClineChat(w http.ResponseWriter, params map[string]any, isStream, upst
 				triedEmails = append(triedEmails, accountEmail(acc))
 				continue
 			}
-			log.Printf("  api error: %v", err)
-			insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "api_error"},
-			})
+			writeUpstreamError(w, ctx, err)
 			return
 		}
 
@@ -622,7 +623,7 @@ func serveClineChat(w http.ResponseWriter, params map[string]any, isStream, upst
 		out, u, err := decodeOpenAINonStream(resp, usageFn)
 		resp.Body.Close()
 		if err != nil {
-			insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
@@ -678,6 +679,31 @@ func emptyResponseMessage(triedEmails []string) string {
 		len(triedEmails)+1, strings.Join(triedEmails, ", "))
 }
 
+// writeUpstreamError 把 callClineAPI 的错误翻译成客户端响应：
+// 全账号冷却 → 429 + Retry-After（让客户端知道该等多久），其余 → 500。
+// 三个入口（chat / messages / responses）共用，保证同一类错误状态码一致。
+func writeUpstreamError(w http.ResponseWriter, ctx *requestContext, err error) {
+	var cooling *coolingError
+	if errors.As(err, &cooling) {
+		secs := int(cooling.retryAfter.Seconds())
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		log.Printf("  upstream cooling: %v", err)
+		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusTooManyRequests, kit.Truncate(err.Error(), 2000))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "rate_limit_error"},
+		})
+		return
+	}
+	log.Printf("  api error: %v", err)
+	insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
+	writeJSON(w, http.StatusInternalServerError, map[string]any{
+		"error": map[string]string{"message": err.Error(), "type": "api_error"},
+	})
+}
+
 // writeEmptyResponseError 空回重试仍失败：客户端还没收到任何字节，干净地返回 502。
 func writeEmptyResponseError(w http.ResponseWriter, ctx *requestContext, msg string) {
 	log.Printf("  empty response after retry: %s", msg)
@@ -699,6 +725,11 @@ func callClineAPI(params map[string]any, stream bool, excludeAccountIDs []string
 	acc := pickAccountExcluding(excludeAccountIDs)
 	if acc == nil {
 		ctx.accountEmail = "no_account"
+		// 都在冷却 vs 池里根本没有可用账号：前者是"等一会儿再来"，
+		// 让调用方回 429 + Retry-After，客户端不会立刻空转重试。
+		if wait := cooldownRemaining(); wait > 0 {
+			return nil, nil, ctx, &coolingError{retryAfter: wait, detail: describePoolStatus()}
+		}
 		return nil, nil, ctx, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 	ctx.accountEmail = acc.Email
@@ -1087,7 +1118,7 @@ func writeOpenAINonStream(w http.ResponseWriter, out map[string]any, u tokenUsag
 func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) {
 	out, u, err := decodeOpenAINonStream(upstream, onUsage)
 	if err != nil {
-		insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
+		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
@@ -1799,11 +1830,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	resp, acc, ctx, err := callClineAPI(openAIReq, upstreamStream, nil)
 	ctx.apiFormat = "anthropic"
 	if err != nil {
-		log.Printf("  anthropic api error: %v", err)
-		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeUpstreamError(w, ctx, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -1846,7 +1873,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	var raw map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		// 记一行失败，否则这种解码失败在管理面板错误列表里查不到
-		insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
+		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
@@ -1976,10 +2003,7 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	}
 
 	var u tokenUsage
-	var streamLog *os.File
-	if sf, err := os.OpenFile(kit.ResolveDataPath("cline-proxy-stream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		streamLog = sf
-	}
+	streamLog := openStreamLog()
 	defer func() {
 		if streamLog != nil {
 			streamLog.Close()

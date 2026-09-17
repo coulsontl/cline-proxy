@@ -177,47 +177,23 @@ func TestStreamClineBufferedFailsClosedOnBufferLimit(t *testing.T) {
 // ============ pickAccountExcluding ============
 
 // setupTestStatsDB 建一个临时 sqlite 并注册还原，返回 db。
+// setupTestStatsDB 用真实的 InitStats（同一份 schema + 迁移）建一个临时库，
+// 只把库文件换到 t.TempDir()。以前这里手抄一份 schema，加列之后两边会悄悄漂移
+// （插不进新列，测试却报"没有记录"），直接跑生产 schema 就不会。
 func setupTestStatsDB(t *testing.T) *sql.DB {
 	t.Helper()
-	previousDB := statsDB
-	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "stats.db"))
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
+	previousDB, previousPath := statsDB, statsPath
+	statsPath = filepath.Join(t.TempDir(), "stats.db")
+	statsDB = nil
+	if err := InitStats(); err != nil {
+		statsDB, statsPath = previousDB, previousPath
+		t.Fatalf("init test stats db: %v", err)
 	}
-	statsDB = database
+	database := statsDB
 	t.Cleanup(func() {
-		statsDB = previousDB
 		database.Close()
+		statsDB, statsPath = previousDB, previousPath
 	})
-
-	schema := []string{
-		`CREATE TABLE accounts (
-			account_id TEXT PRIMARY KEY, email TEXT, refresh_token TEXT, access_token TEXT,
-			expires_at INTEGER, status TEXT, cooldown_until INTEGER, fail_count INTEGER,
-			usage_count INTEGER, usage_count_today INTEGER, usage_date TEXT,
-			last_used INTEGER, created_at INTEGER, last_reason TEXT,
-			tokens_total INTEGER NOT NULL DEFAULT 0,
-			tokens_today INTEGER NOT NULL DEFAULT 0,
-			tokens_date TEXT NOT NULL DEFAULT ''
-		)`,
-		`CREATE TABLE api_keys (key TEXT PRIMARY KEY, created_at INTEGER)`,
-		`CREATE TABLE proxy_state (id INTEGER PRIMARY KEY, current_idx INTEGER)`,
-		`INSERT INTO proxy_state(id, current_idx) VALUES(1, 0)`,
-		`CREATE TABLE request_log (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-			api_format TEXT NOT NULL, account_email TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
-			is_stream INTEGER NOT NULL DEFAULT 0, success INTEGER NOT NULL DEFAULT 0,
-			status_code INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
-			completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
-			error_message TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0
-		)`,
-	}
-	for _, statement := range schema {
-		if _, err := database.Exec(statement); err != nil {
-			t.Fatalf("create test schema: %v", err)
-		}
-	}
 	return database
 }
 

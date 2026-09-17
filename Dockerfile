@@ -4,7 +4,12 @@ WORKDIR /build
 COPY go.mod ./
 RUN go mod download 2>/dev/null || true
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o cline-proxy .
+# VERSION 注入到 /admin/api/version 与 /v1/health，便于确认线上跑的是哪个构建：
+#   VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+      -ldflags="-s -w -X cline-go-proxy/internal/app.Version=${VERSION}" \
+      -o cline-proxy .
 
 FROM alpine:3.21
 

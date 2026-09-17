@@ -537,10 +537,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	up, acc, ctx, err := callClineAPI(chat, stream, nil)
 	ctx.apiFormat = "openai"
 	if err != nil {
-		insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
+		writeUpstreamError(w, ctx, err)
 		return
 	}
 	defer up.Body.Close()

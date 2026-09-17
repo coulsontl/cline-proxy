@@ -374,6 +374,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-row">
       <div class="field"><label>账号文件</label><input type="text" id="settingPoolPath" disabled></div>
     </div>
+    <div class="hint" id="buildInfo" style="margin-top:6px"></div>
   </div>
 </div>
 
@@ -1075,6 +1076,7 @@ async function loadConfig() {
     if (c.strategy) _('settingStrategy').value = c.strategy;
     if (c.version) _('settingVersion').value = c.version;
     if (c.poolPath) _('settingPoolPath').value = c.poolPath;
+    loadBuildInfo();
     loadModelOptions();
     if (c.headers) {
       const tbody = _('headersTableBody');
@@ -1087,6 +1089,27 @@ async function loadConfig() {
       ).join('');
     }
   } catch (e) { /* ignore */ }
+}
+
+// 构建信息：确认线上跑的是哪个构建（排查"部署有没有生效"时先看这里）
+async function loadBuildInfo() {
+  try {
+    const d = await api('GET', '/version');
+    const v = d.data || {};
+    const b = v.binary || {};
+    const parts = [];
+    if (v.goVersion) parts.push(v.goVersion);
+    if (b.builtAt) parts.push('构建于 ' + new Date(b.builtAt).toLocaleString('zh-CN'));
+    if (v.uptime != null) parts.push('已运行 ' + fmtDuration(v.uptime));
+    _('buildInfo').textContent = parts.join(' · ');
+  } catch (e) { /* ignore */ }
+}
+
+function fmtDuration(sec) {
+  if (sec < 60) return sec + ' 秒';
+  if (sec < 3600) return Math.floor(sec / 60) + ' 分钟';
+  if (sec < 86400) return (sec / 3600).toFixed(1) + ' 小时';
+  return (sec / 86400).toFixed(1) + ' 天';
 }
 
 // ========== Cline 上游代理配置 ==========

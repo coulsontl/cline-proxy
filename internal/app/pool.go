@@ -560,6 +560,42 @@ func describePoolStatus() string {
 	return s
 }
 
+// coolingError 表示"池里还有账号，但都在冷却中"——这是"稍后重试"而不是服务端故障，
+// 上层据此返回 429 + Retry-After，客户端（harness 这类）才会乖乖等着而不是空转重试。
+type coolingError struct {
+	retryAfter time.Duration
+	detail     string
+}
+
+func (e *coolingError) Error() string {
+	secs := int(e.retryAfter.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	return fmt.Sprintf("all accounts are cooling down, retry after %ds (%s)", secs, e.detail)
+}
+
+// cooldownRemaining 返回最早解冻的冷却账号还要等多久；没有冷却中的账号时返回 0。
+func cooldownRemaining() time.Duration {
+	p := loadPool()
+	var earliest time.Time
+	for _, a := range p.Accounts {
+		if a.Status != "cooldown" || a.CooldownUntil.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || a.CooldownUntil.Before(earliest) {
+			earliest = a.CooldownUntil
+		}
+	}
+	if earliest.IsZero() {
+		return 0
+	}
+	if d := time.Until(earliest); d > 0 {
+		return d
+	}
+	return 0
+}
+
 // ensureAccountToken 确保 token 有效，必要时刷新。
 func ensureAccountToken(acc *Account) (string, error) {
 	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
