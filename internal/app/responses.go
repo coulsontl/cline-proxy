@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"cline-go-proxy/internal/kit"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -259,6 +260,14 @@ type respToolCall struct {
 	added    bool
 }
 
+// usageIntOf 取 usage 里的整数字段，缺失时给 0。
+func usageIntOf(u map[string]any, key string) int {
+	if v, ok := u[key].(float64); ok {
+		return int(v)
+	}
+	return 0
+}
+
 // usageInt 取 usage 字段，缺失时给 0（避免 JSON 里出现 null）。
 func usageInt(u map[string]any, key string) any {
 	if v, ok := u[key]; ok {
@@ -304,12 +313,19 @@ func callItemID(call *respToolCall, callIndex int) string {
 }
 
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流。
-// 返回 nil 表示上游流正常结束；返回非 nil 表示上游中途断流（已发 response.failed），
-// 调用方据此把这次请求记为失败而不是成功。
-func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) error {
+// 与 chat/messages 出口一致走「提交前缓冲」：见到第一段内容才下发 header，
+// 因此上游空回/提交前断流时调用方还能换号重试（结果由返回值给出）。
+// 记账由调用方做，避免重试时多记一行。
+func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) convertedStreamResult {
+	if _, ok := w.(http.Flusher); !ok {
+		log.Printf("  streaming not supported for client")
+		return convertedStreamResult{outcome: streamFatal, aborted: errors.New("client does not support streaming (no http.Flusher)")}
+	}
+	gate := newCommitGate(w, clineCommitTimeout(), sseHeaderMap())
+
 	model := ""
 	// 开场
-	s := newResponsesSSE(w)
+	s := newResponsesSSE(gate)
 	s.event("response.created", map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
@@ -329,8 +345,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		nextIndex int
 		textIndex = -1
 		outText   strings.Builder
-		lastUsage map[string]any
-		calls     = map[int]*respToolCall{}
+		lastUsage  map[string]any
+		sawContent bool
+		calls      = map[int]*respToolCall{}
 		callOrder []int
 	)
 
@@ -482,6 +499,12 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 						}
 					}
 				}
+				// 出现有意义内容（content / tool_calls / reasoning）就提交：
+				// 提交后不能再换号，但客户端立刻收到流。
+				if hasChunkContent(obj) {
+					sawContent = true
+					gate.Commit()
+				}
 			}
 		}
 		if err != nil {
@@ -493,7 +516,13 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	}
 
 	if streamErr != nil {
-		// 上游中途断流：头已发出，只能发 response.failed，不能发 response.completed
+		if !gate.Committed() {
+			// 提交前断流：客户端一个字节都没收到，丢弃缓冲让调用方换号重试
+			log.Printf("  pre-commit responses stream error: %v", streamErr)
+			gate.Discard()
+			return convertedStreamResult{outcome: streamEmpty, aborted: streamErr, sawContent: sawContent}
+		}
+		// 提交后断流：头已发出，只能发 response.failed，不能发 response.completed
 		// （否则客户端会把被截断的结果当成正常完成）。调用方据返回值记失败。
 		log.Printf("  responses upstream stream aborted: %v", streamErr)
 		s.event("response.failed", map[string]any{
@@ -510,7 +539,14 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				},
 			},
 		})
-		return streamErr
+		return convertedStreamResult{outcome: streamCommitted, aborted: streamErr, sawContent: sawContent}
+	}
+
+	if !gate.Committed() {
+		// 一路没有内容：空回，丢弃缓冲让调用方换号重试
+		log.Printf("  empty responses stream detected (eof)")
+		gate.Discard()
+		return convertedStreamResult{outcome: streamEmpty, sawContent: sawContent}
 	}
 
 	// 收尾：文本项
@@ -564,7 +600,11 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"usage":       openAIUsageToResponses(lastUsage),
 		},
 	})
-	return nil
+	return convertedStreamResult{outcome: streamCommitted, sawContent: sawContent, usage: tokenUsage{
+		promptTokens:     usageIntOf(lastUsage, "prompt_tokens"),
+		completionTokens: usageIntOf(lastUsage, "completion_tokens"),
+		totalTokens:      usageIntOf(lastUsage, "total_tokens"),
+	}}
 }
 
 // ============ /v1/responses 入口 ============
@@ -619,21 +659,42 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		defer resp.Body.Close()
 		if isStream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.WriteHeader(http.StatusOK)
-			// zen 走 zen-stats.jsonl 统计，这里不写 SQLite request_log；
-			// 断流时函数内部已发 response.failed，只补日志。
-			if err := chatStreamToResponses(w, resp, nil); err != nil {
-				log.Printf("  responses zen: upstream stream aborted: %v", err)
+			// zen 走 zen-stats.jsonl 统计，这里不写 SQLite request_log。
+			// 空回/断流与 cline 出口同样检测：zen 换不了号，只能明确报 502。
+			result := chatStreamToResponses(w, resp, nil)
+			if result.outcome == streamCommitted && result.aborted == nil && result.sawContent {
+				return
 			}
+			if result.outcome == streamCommitted {
+				// header 已发出（提交后断流 / 超时兜底的空流）：改不了状态码，只记日志。
+				msg := emptyCommittedMessage()
+				if result.aborted != nil {
+					msg = "upstream stream aborted: " + result.aborted.Error()
+				}
+				log.Printf("  responses zen: %s", msg)
+				return
+			}
+			msg := "zen upstream returned an empty response (no content)"
+			if result.aborted != nil {
+				msg = "upstream stream aborted: " + result.aborted.Error()
+			}
+			log.Printf("  responses zen: %s", msg)
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"message": msg, "type": "empty_response"},
+			})
 			return
 		}
 		var raw map[string]any
 		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		if !hasResponseContent(raw) {
+			msg := "zen upstream returned an empty response (no content)"
+			log.Printf("  responses zen: %s", msg)
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": map[string]string{"message": msg, "type": "empty_response"},
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, chatToResponses(raw))
@@ -645,65 +706,113 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !isStream && modelNeedsStream(normalizeRequestModel(chatModel)) {
 		stream = true
 	}
-	up, acc, ctx, err := callClineAPI(chat, stream, nil)
-	ctx.apiFormat = "openai"
-	if err != nil {
-		writeUpstreamError(w, ctx, err)
-		return
-	}
-	defer up.Body.Close()
-
-	usageFn := accountUsageFn(acc, chat)
-	if isStream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(http.StatusOK)
-		if err := chatStreamToResponses(w, up, usageFn); err != nil {
-			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusBadGateway, "upstream stream aborted: "+err.Error())
+	// 与 chat/messages 一致：空回/5xx/网络错误换号重试（次数见设置页），
+	// 流式靠「提交前缓冲」，所以重试时客户端一个字节都没收到。
+	retries := clineRetryCount()
+	var (
+		tried       []string
+		triedEmails []string
+	)
+	for attempt := 0; attempt <= retries; attempt++ {
+		up, acc, ctx, err := callClineAPI(chat, stream, tried)
+		ctx.apiFormat = "openai"
+		ctx.attempts = attempt + 1
+		if err != nil {
+			if attempt < retries && isRetryableClineError(err, ctx) {
+				log.Printf("  retry %d/%d after upstream error (account %s): %v",
+					attempt+1, retries, accountEmail(acc), err)
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, accountEmail(acc))
+				continue
+			}
+			writeUpstreamError(w, ctx, err)
 			return
 		}
-		insertRequestRecord(ctx, tokenUsage{}, true, 200, "")
-		return
-	}
-	if stream {
-		out, _, err := collectStreamResponse(up)
+
+		usageFn := accountUsageFn(acc, chat)
+		if isStream {
+			result := chatStreamToResponses(w, up, usageFn)
+			up.Body.Close()
+			switch result.outcome {
+			case streamCommitted:
+				if result.aborted != nil {
+					insertRequestRecord(ctx, result.usage, false, http.StatusBadGateway, "upstream stream aborted: "+result.aborted.Error())
+					return
+				}
+				if !result.sawContent {
+					insertRequestRecord(ctx, result.usage, false, http.StatusBadGateway, emptyCommittedMessage())
+					return
+				}
+				insertRequestRecord(ctx, result.usage, true, 200, "")
+				return
+			case streamFatal:
+				msg := "client does not support streaming"
+				if result.aborted != nil {
+					msg = result.aborted.Error()
+				}
+				writeEmptyResponseError(w, ctx, msg)
+				return
+			}
+			if attempt < retries {
+				log.Printf("  retry %d/%d after empty stream (account %s)", attempt+1, retries, accountEmail(acc))
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, acc.Email)
+				continue
+			}
+			writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+			return
+		}
+
+		if stream {
+			// 非流式但模型要求走上游流：聚合后再判定空回
+			out, sawContent, err := collectStreamResponse(up)
+			up.Body.Close()
+			if err != nil {
+				insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			if !sawContent {
+				if attempt < retries {
+					log.Printf("  retry %d/%d after empty aggregated response (account %s)", attempt+1, retries, accountEmail(acc))
+					tried = appendExcludedAccount(tried, acc)
+					triedEmails = append(triedEmails, acc.Email)
+					continue
+				}
+				writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+				return
+			}
+			var u tokenUsage
+			if usage, ok := out["usage"].(map[string]any); ok {
+				extractOpenAIUsage(usage, &u)
+				if len(usage) > 0 {
+					usageFn(usage)
+				}
+			}
+			writeJSON(w, http.StatusOK, chatToResponses(out))
+			insertRequestRecord(ctx, u, true, 200, "")
+			return
+		}
+
+		out, u, err := decodeOpenAINonStream(up, usageFn)
+		up.Body.Close()
 		if err != nil {
 			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		var u tokenUsage
-		if usage, ok := out["usage"].(map[string]any); ok {
-			extractOpenAIUsage(usage, &u)
-			if len(usage) > 0 {
-				usageFn(usage)
+		if !hasResponseContent(out) {
+			if attempt < retries {
+				log.Printf("  retry %d/%d after empty non-stream response (account %s)", attempt+1, retries, accountEmail(acc))
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, acc.Email)
+				continue
 			}
+			writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+			return
 		}
 		writeJSON(w, http.StatusOK, chatToResponses(out))
 		insertRequestRecord(ctx, u, true, 200, "")
 		return
 	}
-	var raw map[string]any
-	if err := json.NewDecoder(up.Body).Decode(&raw); err != nil {
-		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	var u tokenUsage
-	if usage, ok := raw["usage"].(map[string]any); ok {
-		extractOpenAIUsage(usage, &u)
-		if len(usage) > 0 {
-			usageFn(usage)
-		}
-	}
-	out := raw
-	if data, ok := raw["data"]; ok {
-		if d, ok := data.(map[string]any); ok {
-			out = d
-		}
-	}
-	writeJSON(w, http.StatusOK, chatToResponses(out))
-	insertRequestRecord(ctx, u, true, 200, "")
 }

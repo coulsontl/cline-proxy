@@ -82,6 +82,26 @@ func TestApplyClineConfigPatchSettingsPageShape(t *testing.T) {
 	}
 }
 
+func TestApplyClineConfigPatchCommitTimeout(t *testing.T) {
+	// 未出现 → 保持原值（不因为改了别的字段被清成 nil/默认值）
+	next, err := applyClineConfigPatch(baseClineConfig(), patchFromJSON(t, `{"retryCount":2}`))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if next.CommitTimeoutSec != nil {
+		t.Fatalf("unmentioned commitTimeoutSec must stay nil, got %v", *next.CommitTimeoutSec)
+	}
+
+	// 显式 0（关闭超时兜底）必须被保留，不能被当成"未配置"
+	next, err = applyClineConfigPatch(baseClineConfig(), patchFromJSON(t, `{"commitTimeoutSec":0}`))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if next.CommitTimeoutSec == nil || *next.CommitTimeoutSec != 0 {
+		t.Fatalf("explicit 0 must be honoured, got %v", next.CommitTimeoutSec)
+	}
+}
+
 func TestApplyClineConfigPatchRejectsInvalidValues(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -90,6 +110,8 @@ func TestApplyClineConfigPatchRejectsInvalidValues(t *testing.T) {
 	}{
 		{"retryCount negative", `{"retryCount":-1}`, "retryCount"},
 		{"retryCount above max", `{"retryCount":99}`, "retryCount"},
+		{"commitTimeout negative", `{"commitTimeoutSec":-1}`, "commitTimeoutSec"},
+		{"commitTimeout above max", `{"commitTimeoutSec":601}`, "commitTimeoutSec"},
 		{"bad strategy", `{"proxyStrategy":"sticky"}`, "proxyStrategy"},
 		{"bad proxy url", `{"proxies":["127.0.0.1:1080"]}`, "代理"},
 	}

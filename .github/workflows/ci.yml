@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: go test -race
+        run: go test -count=1 -race ./internal/app/
+
+      # Dockerfile 构建目标：静态 linux 二进制能编出来就说明部署链路没断
+      - name: cross build (linux, CGO off)
+        run: CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /dev/null .

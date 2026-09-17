@@ -104,6 +104,31 @@ func TestServeClineChatCoolingAccountsReturns429(t *testing.T) {
 	}
 }
 
+// callClineAPI 有些失败路径不会设 statusCode（建请求失败、池里没有账号），
+// 这时记账必须落到实际回给客户端的 500，而不是 0（否则错误列表里一片 status_code=0）。
+func TestServeClineChatRecords500WhenStatusCodeUnset(t *testing.T) {
+	setupTestStatsDB(t)
+	setClineRetryCountForTest(t, 0)
+
+	rec := httptest.NewRecorder()
+	serveClineChat(rec, map[string]any{"model": "m"}, false, false,
+		func(params map[string]any, stream bool, exclude []string) (*http.Response, *Account, *requestContext, error) {
+			return nil, nil, &requestContext{model: "m", startAt: time.Now()},
+				fmt.Errorf("no active accounts available: total=0")
+		})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", rec.Code)
+	}
+	var status int
+	if err := statsDB.QueryRow(`SELECT status_code FROM request_log ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatalf("query request_log: %v", err)
+	}
+	if status != http.StatusInternalServerError {
+		t.Fatalf("recorded status = %d, want 500", status)
+	}
+}
+
 func TestCooldownRemainingUsesEarliestAccount(t *testing.T) {
 	db := setupTestStatsDB(t)
 	seedActiveAccounts(t, db, "acc-1")

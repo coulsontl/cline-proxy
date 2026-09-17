@@ -69,6 +69,9 @@ func resolveZenModel(id string) (*ZenModel, bool) {
 	if id == "" {
 		return nil, false
 	}
+	// 自己保证种子表已就绪：以前只有 routeModel 会先调 initZenModels，
+	// 直接调用（新入口/测试）时 zenModels 还是空的，任何模型都会被判成"不是免费模型"。
+	initZenModels()
 	zenModelsMu.RLock()
 	defer zenModelsMu.RUnlock()
 	if m, ok := zenAliases[id]; ok {

@@ -432,12 +432,51 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 	}
 
 	if isStream {
-		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）
-		handleStreamResponse(w, resp, nil, usageFn)
-		tracker.finish(true, resp.StatusCode)
+		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）。
+		// 空回检测同样适用：上游 200 但没内容时明确报 502，而不是给客户端一个
+		// "静默空答"的空流（zen 没有账号池，换不了号，只能报错）。
+		outcome, _, err := streamClineBuffered(w, resp, nil, usageFn)
+		if outcome == streamCommitted {
+			tracker.finish(true, resp.StatusCode)
+			return
+		}
+		if outcome == streamCommittedEmpty {
+			// header 已经被超时兜底发出去、内容却为空：没法再写 502（会变成
+			// "superfluous WriteHeader"），但统计必须记失败，否则就是静默空答。
+			log.Printf("  zen: empty response committed by pre-commit timeout")
+			tracker.finish(false, http.StatusBadGateway)
+			return
+		}
+		msg := "zen upstream returned an empty response (no content)"
+		if err != nil {
+			msg = err.Error()
+		}
+		log.Printf("  zen: %s", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": msg, "type": "empty_response"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
 		return
 	}
-	handleNonStreamResponse(w, resp, nil, usageFn)
+
+	chatOut, _, err := decodeOpenAINonStream(resp, usageFn)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+		})
+		tracker.finish(false, http.StatusInternalServerError)
+		return
+	}
+	if !hasResponseContent(chatOut) {
+		msg := "zen upstream returned an empty response (no content)"
+		log.Printf("  zen: %s", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": msg, "type": "empty_response"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, chatOut)
 	tracker.finish(true, resp.StatusCode)
 }
 
@@ -556,6 +595,11 @@ func serveClineChat(w http.ResponseWriter, params map[string]any, isStream, upst
 			outcome, _, fatalErr := streamClineBuffered(w, resp, ctx, usageFn)
 			switch outcome {
 			case streamCommitted:
+				resp.Body.Close()
+				return
+			case streamCommittedEmpty:
+				// 超时兜底已发 header 但整条流没内容：streamClineBuffered 已记 502，
+				// 这里不能再写响应体（header 已发出），也不能记成功。
 				resp.Body.Close()
 				return
 			case streamFatal:
@@ -698,7 +742,13 @@ func writeUpstreamError(w http.ResponseWriter, ctx *requestContext, err error) {
 		return
 	}
 	log.Printf("  api error: %v", err)
-	insertRequestRecord(ctx, tokenUsage{}, false, ctx.statusCode, kit.Truncate(err.Error(), 2000))
+	// 调用方不一定设过 statusCode（如建请求失败、池里没有账号），
+	// 这时按实际回给客户端的 500 记账，否则错误列表里会出现 status_code=0。
+	sc := ctx.statusCode
+	if sc == 0 {
+		sc = http.StatusInternalServerError
+	}
+	insertRequestRecord(ctx, tokenUsage{}, false, sc, kit.Truncate(err.Error(), 2000))
 	writeJSON(w, http.StatusInternalServerError, map[string]any{
 		"error": map[string]string{"message": err.Error(), "type": "api_error"},
 	})
@@ -883,48 +933,9 @@ func getMsgCount(params map[string]any) int {
 	return 0
 }
 
-func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		log.Printf("  streaming not supported for client")
-		insertRequestRecord(ctx, tokenUsage{}, false, 0, "streaming not supported")
-		return
-	}
-
-	var u tokenUsage
-	reader := bufio.NewReader(upstream.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				if line != "" {
-					w.Write([]byte(line + "\n"))
-				}
-				break
-			}
-			// 上游中途断流：记录真实原因，否则只剩一个 200 + 空 body，
-			// 客户端只能报笼统的 "stream ended without terminal event"。
-			log.Printf("  upstream stream aborted: %v", err)
-			insertRequestRecord(ctx, u, false, http.StatusBadGateway, "upstream stream aborted: "+err.Error())
-			return
-		}
-
-		out, _, _ := processStreamLine(line, &u, onUsage)
-		w.Write([]byte(out))
-		flusher.Flush()
-	}
-	insertRequestRecord(ctx, u, true, 200, "")
-}
-
 // processStreamLine 处理一行上游 SSE，返回应下发给客户端的字节、归一化后的对象
 // （能解析为 JSON 时非 nil）以及该行是否为终止事件（[DONE] 或 finish_reason）。
-// 逐行处理逻辑从 handleStreamResponse 原样抽出，两条流式出口共用。
+// cline 与 zen 两条流式出口共用（都走 streamClineBuffered）。
 func processStreamLine(line string, u *tokenUsage, onUsage func(map[string]any)) (string, map[string]any, bool) {
 	line = strings.TrimRight(line, "\r\n")
 
@@ -967,16 +978,20 @@ func processStreamLine(line string, u *tokenUsage, onUsage func(map[string]any))
 	return line + "\n", nil, false
 }
 
-// streamOutcome 是"提交前缓冲"流式出口的三态结果。
+// streamOutcome 是"提交前缓冲"流式出口的结果。
 type streamOutcome int
 
 const (
-	// streamCommitted 已提交并下发（含提交后中途断流：内部已记录 502），不可重试
+	// streamCommitted 已提交并下发内容（含提交后中途断流：内部已记录 502），不可重试
 	streamCommitted streamOutcome = iota
 	// streamEmpty 未提交且始终没有内容 → 可换号重试
 	streamEmpty
 	// streamFatal 未提交但超出缓冲上限 / 客户端不支持流式 → 直接报错，不重试
 	streamFatal
+	// streamCommittedEmpty 被「提交前超时」兜底提交了 header，但整条流一直没有内容。
+	// 状态码已经发出去、改不了，也换不了号；调用方只能把它记成失败（内部已记 request_log）
+	// 而不能记成功——否则线上又是"查不到的静默空答"。
+	streamCommittedEmpty
 )
 
 // 提交前私有缓冲上限，量级照抄 axonhub（maxPreCommitBufferedEvents/Bytes）。
@@ -987,36 +1002,49 @@ const (
 	maxPreCommitBytes  = 8 << 20
 )
 
-// streamClineBuffered 以"提交前私有缓冲"方式转发 cline 上游流：
-// 事件先缓冲不外发，直到出现有意义内容才提交（写 header + 回放缓冲）并继续流式；
+// sseHeaderMap 是流式响应的公共 header（提交时才真正下发，见 commitGate）。
+func sseHeaderMap() map[string]string {
+	return map[string]string{
+		"Content-Type":                "text/event-stream",
+		"Cache-Control":               "no-cache",
+		"Connection":                  "keep-alive",
+		"Access-Control-Allow-Origin": "*",
+	}
+}
+
+// streamClineBuffered 以「提交前私有缓冲」方式转发 cline 上游流：
+// 事件先缓冲不外发，直到出现有意义内容才提交（下发 header + 回放缓冲）并继续流式；
 // 若先等到终止事件（或 EOF）仍无内容，则丢弃缓冲返回 streamEmpty，让上层换号重试。
 // 关键收益：失败发生在向客户端写出任何字节之前，因此可以干净地改成 502，
 // 而不是给客户端一个 200 + 空 body（客户端只能报 stream ended without terminal event）。
+//
+// 超过 clineCommitTimeout() 还没等到内容时，commitGate 会自动提交（客户端先拿到
+// header，避免首字节超时），此后按 streamCommitted 处理、不再换号。
 func streamClineBuffered(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) (streamOutcome, tokenUsage, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		log.Printf("  streaming not supported for client")
 		return streamFatal, tokenUsage{}, errors.New("client does not support streaming (no http.Flusher)")
 	}
 
+	gate := newCommitGate(w, clineCommitTimeout(), sseHeaderMap())
+
 	var (
-		u         tokenUsage
-		buf       strings.Builder
-		events    int
-		committed bool
+		u          tokenUsage
+		events     int
+		sawContent bool // 整条流里有没有出现过有意义内容（提交后继续统计，用于记账）
 	)
 
-	commit := func() {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(http.StatusOK)
-		if buf.Len() > 0 {
-			w.Write([]byte(buf.String()))
+	// 这次尝试不行了：丢弃缓冲；但如果门已经被「提交前超时」兜底提交，
+	// 客户端已经收到 200 + header，就只能按已提交处理（不能再换号/改状态码）。
+	giveUp := func(outcome streamOutcome, reason string) (streamOutcome, tokenUsage, error) {
+		log.Printf("  %s", reason)
+		gate.Discard()
+		if gate.Committed() {
+			log.Printf("  %s: already committed by pre-commit timeout, cannot retry", reason)
+			insertRequestRecord(ctx, u, false, http.StatusBadGateway, reason+" (committed by pre-commit timeout)")
+			return streamCommittedEmpty, u, nil
 		}
-		flusher.Flush()
-		committed = true
+		return outcome, u, nil
 	}
 
 	reader := bufio.NewReader(upstream.Body)
@@ -1024,33 +1052,35 @@ func streamClineBuffered(w http.ResponseWriter, upstream *http.Response, ctx *re
 		line, err := reader.ReadString('\n')
 		eos := err != nil
 		if eos && err != io.EOF {
-			if !committed {
+			if !gate.Committed() {
 				// 提交前上游断流：与空回同等对待，换号重试一次
-				log.Printf("  pre-commit upstream stream error: %v", err)
-				return streamEmpty, u, nil
+				return giveUp(streamEmpty, "pre-commit upstream stream error: "+err.Error())
 			}
 			log.Printf("  upstream stream aborted: %v", err)
 			insertRequestRecord(ctx, u, false, http.StatusBadGateway, "upstream stream aborted: "+err.Error())
+			if !sawContent {
+				return streamCommittedEmpty, u, nil
+			}
 			return streamCommitted, u, nil
 		}
 
 		if line != "" {
 			out, obj, terminal := processStreamLine(line, &u, onUsage)
-			if committed {
-				w.Write([]byte(out))
-				flusher.Flush()
-			} else {
-				buf.WriteString(out)
+			gate.Write([]byte(out))
+			gate.Flush()
+			if obj != nil && hasChunkContent(obj) {
+				sawContent = true
+			}
+			if !gate.Committed() {
 				events++
-				if obj != nil && hasChunkContent(obj) {
-					commit()
-				} else if terminal {
+				switch {
+				case obj != nil && hasChunkContent(obj):
+					gate.Commit()
+				case terminal:
 					// 终止事件但一路没有内容 → 空回，丢弃缓冲
-					log.Printf("  empty response detected (events=%d)", events)
-					return streamEmpty, u, nil
-				} else if events > maxPreCommitEvents || buf.Len() > maxPreCommitBytes {
-					log.Printf("  pre-commit buffer exceeded (events=%d bytes=%d)", events, buf.Len())
-					return streamFatal, u, fmt.Errorf("pre-commit stream buffer limit exceeded (events=%d bytes=%d)", events, buf.Len())
+					return giveUp(streamEmpty, fmt.Sprintf("empty response detected (events=%d)", events))
+				case events > maxPreCommitEvents || gate.BufferedLen() > maxPreCommitBytes:
+					return giveUp(streamFatal, fmt.Sprintf("pre-commit stream buffer limit exceeded (events=%d bytes=%d)", events, gate.BufferedLen()))
 				}
 			}
 		}
@@ -1060,10 +1090,17 @@ func streamClineBuffered(w http.ResponseWriter, upstream *http.Response, ctx *re
 		}
 	}
 
-	if !committed {
-		// 既没有内容也没有终止事件就结束了（含上游 0 字节）：空回
-		log.Printf("  empty response detected (events=%d, eof)", events)
-		return streamEmpty, u, nil
+	if !sawContent {
+		// 一条流里始终没有内容（含上游 0 字节、以及只有 role/finish_reason 的空流）。
+		// 提交前 → 丢弃缓冲让上层换号重试；已经提交（超时兜底）→ 客户端已收到 200，
+		// 改不了状态码，但绝不能记成功（否则线上又变成查不到的静默空答）。
+		if gate.Committed() {
+			reason := fmt.Sprintf("empty response detected (events=%d, committed by pre-commit timeout)", events)
+			log.Printf("  %s", reason)
+			insertRequestRecord(ctx, u, false, http.StatusBadGateway, reason)
+			return streamCommittedEmpty, u, nil
+		}
+		return giveUp(streamEmpty, fmt.Sprintf("empty response detected (events=%d, eof)", events))
 	}
 	insertRequestRecord(ctx, u, true, 200, "")
 	return streamCommitted, u, nil
@@ -1113,18 +1150,6 @@ func decodeOpenAINonStream(upstream *http.Response, onUsage func(map[string]any)
 func writeOpenAINonStream(w http.ResponseWriter, out map[string]any, u tokenUsage, ctx *requestContext) {
 	writeJSON(w, http.StatusOK, out)
 	insertRequestRecord(ctx, u, true, 200, "")
-}
-
-func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, onUsage func(map[string]any)) {
-	out, u, err := decodeOpenAINonStream(upstream, onUsage)
-	if err != nil {
-		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-		})
-		return
-	}
-	writeOpenAINonStream(w, out, u, ctx)
 }
 
 // 返回的 bool 表示"整条流里是否出现过有意义内容"，供空回检测使用：
@@ -1827,40 +1852,125 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  anthropic model %s requires stream: forcing upstream stream, will aggregate", req.Model)
 	}
 
-	resp, acc, ctx, err := callClineAPI(openAIReq, upstreamStream, nil)
-	ctx.apiFormat = "anthropic"
-	if err != nil {
-		writeUpstreamError(w, ctx, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	usageFn := accountUsageFn(acc, openAIReq)
-
-	if req.Stream {
-		handleAnthropicStream(w, resp, ctx, normalizeRequestModel(req.Model), toolSchemas, usageFn)
-		return
-	}
-
-	if upstreamStream {
-		out, _, err := collectStreamResponse(resp)
+	// 与 /v1/chat/completions 一致的失败处理：空回/5xx/网络错误换号重试（次数见设置页）。
+	// 流式靠「提交前缓冲」，所以重试时客户端一个字节都没收到。
+	retries := clineRetryCount()
+	var (
+		tried       []string
+		triedEmails []string
+	)
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, acc, ctx, err := callClineAPI(openAIReq, upstreamStream, tried)
+		ctx.apiFormat = "anthropic"
+		ctx.attempts = attempt + 1
 		if err != nil {
-			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
+			if attempt < retries && isRetryableClineError(err, ctx) {
+				log.Printf("  retry %d/%d after upstream error (account %s): %v",
+					attempt+1, retries, accountEmail(acc), err)
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, accountEmail(acc))
+				continue
+			}
+			writeUpstreamError(w, ctx, err)
+			return
+		}
+
+		usageFn := accountUsageFn(acc, openAIReq)
+
+		if req.Stream {
+			result := handleAnthropicStream(w, resp, normalizeRequestModel(req.Model), toolSchemas, usageFn)
+			resp.Body.Close()
+			switch result.outcome {
+			case streamCommitted:
+				if result.aborted != nil {
+					insertRequestRecord(ctx, result.usage, false, http.StatusBadGateway, "upstream stream aborted: "+result.aborted.Error())
+					return
+				}
+				if !result.sawContent {
+					// 提交前超时兜底已经把 200 发给客户端了，状态码改不了，但必须记失败
+					insertRequestRecord(ctx, result.usage, false, http.StatusBadGateway, emptyCommittedMessage())
+					return
+				}
+				insertRequestRecord(ctx, result.usage, true, 200, "")
+				return
+			case streamFatal:
+				msg := "client does not support streaming"
+				if result.aborted != nil {
+					msg = result.aborted.Error()
+				}
+				writeEmptyResponseError(w, ctx, msg)
+				return
+			}
+			// streamEmpty：头还没发出去，可以换号重试
+			if attempt < retries {
+				log.Printf("  retry %d/%d after empty stream (account %s)", attempt+1, retries, accountEmail(acc))
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, acc.Email)
+				continue
+			}
+			writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+			return
+		}
+
+		if upstreamStream {
+			out, sawContent, err := collectStreamResponse(resp)
+			resp.Body.Close()
+			if err != nil {
+				insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, kit.Truncate(err.Error(), 2000))
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error": map[string]string{"message": err.Error(), "type": "parse_error"},
+				})
+				return
+			}
+			if !sawContent {
+				if attempt < retries {
+					log.Printf("  retry %d/%d after empty aggregated response (account %s)", attempt+1, retries, accountEmail(acc))
+					tried = appendExcludedAccount(tried, acc)
+					triedEmails = append(triedEmails, acc.Email)
+					continue
+				}
+				writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+				return
+			}
+			if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
+				usageFn(u)
+			}
+			out = normalizeOpenAIResponse(out)
+
+			var u tokenUsage
+			if usage, ok := out["usage"].(map[string]any); ok {
+				extractOpenAIUsage(usage, &u)
+			}
+
+			anthropicResp := openAIToAnthropic(out)
+			if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
+				anthropicResp["stop_reason"] = "tool_use"
+			}
+			writeJSON(w, http.StatusOK, anthropicResp)
+			insertRequestRecord(ctx, u, true, 200, "")
+			return
+		}
+
+		out, u, err := decodeOpenAINonStream(resp, usageFn)
+		resp.Body.Close()
+		if err != nil {
+			// 记一行失败，否则这种解码失败在管理面板错误列表里查不到
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 			})
 			return
 		}
-		if u, ok := out["usage"].(map[string]any); ok && len(u) > 0 {
-			usageFn(u)
+		if !hasResponseContent(out) {
+			if attempt < retries {
+				log.Printf("  retry %d/%d after empty non-stream response (account %s)", attempt+1, retries, accountEmail(acc))
+				tried = appendExcludedAccount(tried, acc)
+				triedEmails = append(triedEmails, acc.Email)
+				continue
+			}
+			writeEmptyResponseError(w, ctx, emptyResponseMessage(triedEmails))
+			return
 		}
-		out = normalizeOpenAIResponse(out)
-
-		var u tokenUsage
-		if usage, ok := out["usage"].(map[string]any); ok {
-			extractOpenAIUsage(usage, &u)
-		}
-
 		anthropicResp := openAIToAnthropic(out)
 		if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 			anthropicResp["stop_reason"] = "tool_use"
@@ -1869,41 +1979,8 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		insertRequestRecord(ctx, u, true, 200, "")
 		return
 	}
-
-	var raw map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		// 记一行失败，否则这种解码失败在管理面板错误列表里查不到
-		insertRequestRecord(ctx, tokenUsage{}, false, http.StatusInternalServerError, "decode upstream: "+err.Error())
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-		})
-		return
-	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
-	}
-	out := raw
-	if data, ok := raw["data"]; ok {
-		if d, ok := data.(map[string]any); ok {
-			out = d
-		}
-	}
-	out = normalizeOpenAIResponse(out)
-	anthropicResp := openAIToAnthropic(out)
-
-	if tc, ok := getNested(out, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
-		anthropicResp["stop_reason"] = "tool_use"
-	}
-
-	var u2 tokenUsage
-	if usage, ok := out["usage"].(map[string]any); ok {
-		extractOpenAIUsage(usage, &u2)
-	}
-	writeJSON(w, http.StatusOK, anthropicResp)
-	insertRequestRecord(ctx, u2, true, 200, "")
 }
 
-// handleZenAnthropic Anthropic Messages 请求路由到 zen 免费模型上游
 func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq, openAIReq map[string]any, toolSchemas map[string]map[string]bool) {
 	cfg := getZenConfig()
 	if !cfg.Enabled {
@@ -1957,30 +2034,52 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	}
 
 	if isStream {
-		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）
-		handleAnthropicStream(w, resp, nil, zm.ID, toolSchemas, usageFn)
-		tracker.finish(true, resp.StatusCode)
+		// zen 走 zen-stats.jsonl 统计，不写 SQLite request_log（两套统计不交叉）。
+		// 空回检测同样适用：zen 没有账号池，换不了号，只能明确报 502。
+		result := handleAnthropicStream(w, resp, zm.ID, toolSchemas, usageFn)
+		if result.outcome == streamCommitted && result.aborted == nil && result.sawContent {
+			tracker.finish(true, resp.StatusCode)
+			return
+		}
+		if result.outcome == streamCommitted {
+			// header 已发出（提交后断流 / 超时兜底的空流）：改不了状态码，只记失败。
+			msg := emptyCommittedMessage()
+			if result.aborted != nil {
+				msg = "upstream stream aborted: " + result.aborted.Error()
+			}
+			log.Printf("  anthropic zen: %s", msg)
+			tracker.finish(false, http.StatusBadGateway)
+			return
+		}
+		msg := "zen upstream returned an empty response (no content)"
+		if result.aborted != nil {
+			msg = "upstream stream aborted: " + result.aborted.Error()
+		}
+		log.Printf("  anthropic zen: %s", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": msg, "type": "empty_response"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
 		return
 	}
 
-	var raw map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	chatOut, _, err := decodeOpenAINonStream(resp, usageFn)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
 		tracker.finish(false, http.StatusInternalServerError)
 		return
 	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
+	if !hasResponseContent(chatOut) {
+		msg := "zen upstream returned an empty response (no content)"
+		log.Printf("  anthropic zen: %s", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]string{"message": msg, "type": "empty_response"},
+		})
+		tracker.finish(false, http.StatusBadGateway)
+		return
 	}
-	chatOut := raw
-	if data, ok := raw["data"]; ok {
-		if d, ok := data.(map[string]any); ok {
-			chatOut = d
-		}
-	}
-	chatOut = normalizeOpenAIResponse(chatOut)
 	anthropicResp := openAIToAnthropic(chatOut)
 	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
 		anthropicResp["stop_reason"] = "tool_use"
@@ -1989,20 +2088,23 @@ func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq
 	tracker.finish(true, resp.StatusCode)
 }
 
-func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *requestContext, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
-	log.Printf("  anthropic stream: starting real-time forward")
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.WriteHeader(http.StatusOK)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		insertRequestRecord(ctx, tokenUsage{}, false, 0, "streaming not supported")
-		return
+// handleAnthropicStream 把上游 chat.completions SSE 转成 Anthropic SSE。
+// 与 streamClineBuffered 一样走「提交前缓冲」：见到第一段内容才下发 header，
+// 因此上游空回/中途断流时调用方还能换号重试（结果由返回值给出）。
+// 记账不在这里做——调用方（cline / zen）拿到结果自己记，避免重试时多记一行。
+func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) convertedStreamResult {
+	if _, ok := w.(http.Flusher); !ok {
+		log.Printf("  streaming not supported for client")
+		return convertedStreamResult{outcome: streamFatal, aborted: errors.New("client does not support streaming (no http.Flusher)")}
 	}
 
-	var u tokenUsage
+	log.Printf("  anthropic stream: starting real-time forward")
+	gate := newCommitGate(w, clineCommitTimeout(), sseHeaderMap())
+
+	var (
+		u          tokenUsage
+		sawContent bool
+	)
 	streamLog := openStreamLog()
 	defer func() {
 		if streamLog != nil {
@@ -2013,11 +2115,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	emit := func(event string, data any) {
 		d, _ := json.Marshal(data)
 		line := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(d))
-		w.Write([]byte(line))
+		gate.Write([]byte(line))
 		if streamLog != nil {
 			streamLog.WriteString(line)
 		}
-		flusher.Flush()
+		gate.Flush()
 	}
 
 	msgID := "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli())
@@ -2127,6 +2229,13 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 			return
 		}
 
+		// 出现有意义内容（content / tool_calls / reasoning）就提交：提交后这次请求
+		// 不能再换号，但客户端立刻收到流；提交前的空回/断流则整段丢弃去重试。
+		if hasChunkContent(obj) {
+			sawContent = true
+			gate.Commit()
+		}
+
 		// 旁路提取上游 OpenAI 格式 usage（必须在 choices 空检查之前，
 		// 因为 usage-only chunk 的 choices 常为空数组会被跳过）。
 		if usage, ok := obj["usage"].(map[string]any); ok {
@@ -2217,8 +2326,9 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 
 	// 注意区分「正常 EOF」与「上游中途断流」：后者以前被静默 break 掉，
 	// 然后照常发 message_delta/message_stop，客户端会以为请求正常完成、
-	// 统计里也记成功。头已经发出（200 + SSE）改不了状态码，只能按
-	// Anthropic 协议发 error 事件并记为失败。
+	// 统计里也记成功。是否还能改状态码取决于有没有提交过：
+	//   提交前 → 客户端一个字节都没收到，丢弃缓冲换号重试；
+	//   提交后 → 头已发出，只能按 Anthropic 协议发 error 事件，由调用方记失败。
 	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
@@ -2234,6 +2344,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 	}
 
 	if streamErr != nil {
+		if !gate.Committed() {
+			log.Printf("  pre-commit anthropic stream error: %v", streamErr)
+			gate.Discard()
+			return convertedStreamResult{outcome: streamEmpty, aborted: streamErr, usage: u, sawContent: sawContent}
+		}
 		log.Printf("  anthropic upstream stream aborted: %v", streamErr)
 		emit("error", map[string]any{
 			"type": "error",
@@ -2242,8 +2357,14 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 				"message": "upstream stream aborted: " + streamErr.Error(),
 			},
 		})
-		insertRequestRecord(ctx, u, false, http.StatusBadGateway, "upstream stream aborted: "+streamErr.Error())
-		return
+		return convertedStreamResult{outcome: streamCommitted, aborted: streamErr, usage: u, sawContent: sawContent}
+	}
+
+	if !gate.Committed() {
+		// 一路没有内容也没有终止事件：空回，丢弃缓冲让调用方换号重试
+		log.Printf("  empty anthropic response detected (eof)")
+		gate.Discard()
+		return convertedStreamResult{outcome: streamEmpty, usage: u, sawContent: sawContent}
 	}
 
 	// Stop text block if active
@@ -2275,7 +2396,7 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 
 	emit("message_stop", map[string]any{"type": "message_stop"})
 	log.Printf("  anthropic stream done: hasText=%v tools=%d reason=%s", hasText, len(pendingTools), stopReason)
-	insertRequestRecord(ctx, u, true, 200, "")
+	return convertedStreamResult{outcome: streamCommitted, usage: u, sawContent: sawContent}
 }
 
 func normalizeOpenAIResponse(obj map[string]any) map[string]any {

@@ -389,8 +389,12 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>空回/错误重试次数</label>
         <input type="number" id="clineRetryCount" min="0" max="5" step="1" placeholder="1">
       </div>
+      <div class="field"><label>提交前超时（秒）</label>
+        <input type="number" id="clineCommitTimeout" min="0" max="600" step="5" placeholder="60">
+      </div>
     </div>
     <div class="hint" style="margin-bottom:10px">上游返回空内容（HTTP 200 但无 content/tool_calls/reasoning），或 5xx/网络错误时，换一个账号重试的次数。0 = 不重试；默认 1（即失败后再试一次，仍失败返回 502）。</div>
+    <div class="hint" style="margin-bottom:10px">流式请求在「看到第一段内容」之前不向客户端发 header，这样才能在空回时换号重试。提交前超时 = 最多等这么多秒就先把 header 发出去（避免客户端首字节超时），代价是这次请求不再换号重试。0 = 关闭，默认 60。</div>
     <div class="form-row">
       <div class="field"><label>代理列表</label>
         <textarea id="clineProxies" rows="3" placeholder="每行一个: http://user:pass@host:port 或 socks5://host:port&#10;留空则使用 HTTP_PROXY/HTTPS_PROXY 环境变量"></textarea>
@@ -1121,6 +1125,8 @@ async function loadClineConfig() {
     _('clineStrategy').value = c.proxyStrategy || 'round_robin';
     _('clineRetryCount').max = (c.maxRetryCount != null ? c.maxRetryCount : 5);
     _('clineRetryCount').value = (c.retryCount != null ? c.retryCount : 1);
+    _('clineCommitTimeout').max = (c.maxCommitTimeoutSec != null ? c.maxCommitTimeoutSec : 600);
+    _('clineCommitTimeout').value = (c.commitTimeoutSec != null ? c.commitTimeoutSec : 60);
     const hint = _('clineProxyHint');
     hint.textContent = (c.proxies && c.proxies.length)
       ? '当前: 使用配置代理列表(' + c.proxies.length + ' 条)'
@@ -1138,8 +1144,13 @@ async function saveClineConfig() {
   if (retryCount !== null && (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5)) {
     toast('重试次数需为 0-5 的整数', 'error'); return;
   }
+  const commitRaw = _('clineCommitTimeout').value.trim();
+  const commitTimeoutSec = commitRaw === '' ? null : Number(commitRaw);
+  if (commitTimeoutSec !== null && (!Number.isInteger(commitTimeoutSec) || commitTimeoutSec < 0 || commitTimeoutSec > 600)) {
+    toast('提交前超时需为 0-600 的整数秒（0 = 关闭）', 'error'); return;
+  }
   try {
-    const d = await api('POST', '/cline/config/update', { proxies, proxyStrategy: _('clineStrategy').value, retryCount });
+    const d = await api('POST', '/cline/config/update', { proxies, proxyStrategy: _('clineStrategy').value, retryCount, commitTimeoutSec });
     toast(d.message || 'Cline 代理配置已保存', 'success');
     loadClineConfig();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }

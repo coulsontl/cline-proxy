@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"cline-go-proxy/internal/kit"
 )
@@ -19,9 +18,9 @@ func TestChatStreamToResponsesAbortEmitsFailed(t *testing.T) {
 	}}}
 
 	rec := httptest.NewRecorder()
-	err := chatStreamToResponses(rec, upstream, nil)
-	if err == nil {
-		t.Fatal("expected stream abort error to be reported to the caller")
+	result := chatStreamToResponses(rec, upstream, nil)
+	if result.outcome != streamCommitted || result.aborted == nil {
+		t.Fatalf("expected a committed stream that aborted, got %+v", result)
 	}
 
 	body := rec.Body.String()
@@ -41,8 +40,9 @@ func TestChatStreamToResponsesNormalEOFStillCompletes(t *testing.T) {
 		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))}
 
 	rec := httptest.NewRecorder()
-	if err := chatStreamToResponses(rec, upstream, nil); err != nil {
-		t.Fatalf("clean EOF must not be treated as an abort: %v", err)
+	result := chatStreamToResponses(rec, upstream, nil)
+	if result.outcome != streamCommitted || result.aborted != nil {
+		t.Fatalf("clean EOF must not be treated as an abort: %+v", result)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.completed") {
@@ -53,19 +53,35 @@ func TestChatStreamToResponsesNormalEOFStillCompletes(t *testing.T) {
 	}
 }
 
-func TestHandleAnthropicStreamAbortEmitsErrorAndRecordsFailure(t *testing.T) {
+// 提交后断流必须记为失败（以前会记成功）。记账现在由调用方做，
+// 所以这里走真实的 /v1/messages 入口验证端到端。
+func TestHandleAnthropicMessagesStreamAbortRecordsFailure(t *testing.T) {
 	db := setupTestStatsDB(t)
-	ctx := &requestContext{
-		apiFormat:    "anthropic",
-		accountEmail: "abort@example.com",
-		startAt:      time.Now(),
-	}
-	upstream := &http.Response{StatusCode: http.StatusOK, Body: readerCloser{Reader: &interruptedStreamReader{
-		data: "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
-	}}}
+	seedActiveAccounts(t, db, "acc-1")
+	initModelsCache()
 
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, contentLine) // 先给内容（提交），然后连接断开
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic("simulate upstream dropping the connection mid-stream")
+	}))
+	defer srv.Close()
+
+	clineCfg := getClineConfig()
+	kit.RebuildHTTPClient(nil, "")
+	t.Cleanup(func() { kit.RebuildHTTPClient(clineCfg.Proxies, clineCfg.ProxyStrategy) })
+	previousBase := clineAPIBase
+	clineAPIBase = srv.URL
+	t.Cleanup(func() { clineAPIBase = previousBase })
+
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(
+		`{"model":"poolside/laguna-s-2.1:free","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
-	handleAnthropicStream(rec, upstream, ctx, "deepseek/deepseek-v4-flash", map[string]map[string]bool{}, nil)
+	handleAnthropicMessages(rec, req)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, `"type":"error"`) {
@@ -75,10 +91,9 @@ func TestHandleAnthropicStreamAbortEmitsErrorAndRecordsFailure(t *testing.T) {
 		t.Fatalf("aborted anthropic stream must not emit message_stop: %s", body)
 	}
 	if !strings.Contains(body, "message_start") {
-		t.Fatalf("message_start should still have been emitted before the abort: %s", body)
+		t.Fatalf("message_start should still be in the replayed buffer: %s", body)
 	}
 
-	// 必须记为失败（以前会记成功）
 	var success, status int
 	var message string
 	if err := db.QueryRow(`SELECT success, status_code, error_message FROM request_log ORDER BY id DESC LIMIT 1`).

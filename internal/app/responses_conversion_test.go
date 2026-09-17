@@ -149,8 +149,8 @@ func TestChatStreamToResponsesKeepsToolCallsSeparate(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	upstream := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream))}
-	if err := chatStreamToResponses(rec, upstream, nil); err != nil {
-		t.Fatalf("chatStreamToResponses: %v", err)
+	if r := chatStreamToResponses(rec, upstream, nil); r.outcome != streamCommitted || r.aborted != nil {
+		t.Fatalf("unexpected result: %+v", r)
 	}
 
 	events := parseSSEEvents(t, rec.Body.String())
@@ -237,8 +237,8 @@ func TestChatStreamToResponsesEmitsArgumentDeltas(t *testing.T) {
 		"data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
 	upstream := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream))}
-	if err := chatStreamToResponses(rec, upstream, nil); err != nil {
-		t.Fatalf("chatStreamToResponses: %v", err)
+	if r := chatStreamToResponses(rec, upstream, nil); r.outcome != streamCommitted || r.aborted != nil {
+		t.Fatalf("unexpected result: %+v", r)
 	}
 	if !strings.Contains(rec.Body.String(), "response.function_call_arguments.delta") {
 		t.Fatalf("missing arguments delta events: %s", rec.Body.String())
@@ -252,8 +252,8 @@ func TestChatStreamToResponsesTextOnlyUnchanged(t *testing.T) {
 		"data: [DONE]\n\n"
 	rec := httptest.NewRecorder()
 	upstream := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream))}
-	if err := chatStreamToResponses(rec, upstream, nil); err != nil {
-		t.Fatalf("chatStreamToResponses: %v", err)
+	if r := chatStreamToResponses(rec, upstream, nil); r.outcome != streamCommitted || r.aborted != nil {
+		t.Fatalf("unexpected result: %+v", r)
 	}
 	events := parseSSEEvents(t, rec.Body.String())
 	completed := lastEvent(t, events, "response.completed")

@@ -17,10 +17,12 @@ func handleClineConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := getClineConfig()
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"proxies":       cfg.Proxies,
-		"proxyStrategy": cfg.ProxyStrategy,
-		"retryCount":    clineRetryCount(),
-		"maxRetryCount": maxClineRetryCount,
+		"proxies":             cfg.Proxies,
+		"proxyStrategy":       cfg.ProxyStrategy,
+		"retryCount":          clineRetryCount(),
+		"maxRetryCount":       maxClineRetryCount,
+		"commitTimeoutSec":    int(clineCommitTimeout().Seconds()),
+		"maxCommitTimeoutSec": maxCommitTimeoutSec,
 	}})
 }
 
@@ -29,6 +31,7 @@ type clineConfigPatch struct {
 	Proxies       *[]string `json:"proxies"`
 	ProxyStrategy *string   `json:"proxyStrategy"`
 	RetryCount    *int      `json:"retryCount"`
+	CommitTimeout *int      `json:"commitTimeoutSec"`
 }
 
 // applyClineConfigPatch 把部分更新合并到当前配置上。未出现的字段保持原值——
@@ -45,6 +48,11 @@ func applyClineConfigPatch(cur *clineConfigData, patch clineConfigPatch) (*cline
 			return nil, fmt.Errorf("retryCount 必须在 0-%d 之间", maxClineRetryCount)
 		}
 	}
+	if patch.CommitTimeout != nil {
+		if *patch.CommitTimeout < 0 || *patch.CommitTimeout > maxCommitTimeoutSec {
+			return nil, fmt.Errorf("commitTimeoutSec 必须在 0-%d 之间（0 = 关闭超时兜底）", maxCommitTimeoutSec)
+		}
+	}
 
 	next := *cur
 	if patch.Proxies != nil {
@@ -53,6 +61,10 @@ func applyClineConfigPatch(cur *clineConfigData, patch clineConfigPatch) (*cline
 	if patch.RetryCount != nil {
 		retry := *patch.RetryCount
 		next.RetryCount = &retry
+	}
+	if patch.CommitTimeout != nil {
+		timeout := *patch.CommitTimeout
+		next.CommitTimeoutSec = &timeout
 	}
 	if patch.ProxyStrategy != nil && *patch.ProxyStrategy != "" {
 		switch *patch.ProxyStrategy {
@@ -92,8 +104,9 @@ func handleClineConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	setClineConfig(next)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "Cline 代理配置已保存", Data: map[string]any{
-		"proxies":       next.Proxies,
-		"proxyStrategy": next.ProxyStrategy,
-		"retryCount":    clineRetryCount(),
+		"proxies":          next.Proxies,
+		"proxyStrategy":    next.ProxyStrategy,
+		"retryCount":       clineRetryCount(),
+		"commitTimeoutSec": int(clineCommitTimeout().Seconds()),
 	}})
 }

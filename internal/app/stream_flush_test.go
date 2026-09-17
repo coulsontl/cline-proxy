@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 // 回归：requestLogMiddleware 包裹后的 ResponseWriter 必须仍然实现 http.Flusher。
@@ -29,6 +28,8 @@ func TestStatusWriterKeepsFlusher(t *testing.T) {
 }
 
 // 端到端：经请求日志中间件包装后，SSE 流必须真正下发到客户端。
+// 走的是真实的 chat/completions 出口（serveClineChat），固定住了当年
+// "没有 [DONE]、客户端报 stream ended without terminal event" 的那个回归。
 func TestStreamResponseThroughLogMiddleware(t *testing.T) {
 	upstream := &http.Response{
 		StatusCode: http.StatusOK,
@@ -36,9 +37,13 @@ func TestStreamResponseThroughLogMiddleware(t *testing.T) {
 			"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
 				"data: [DONE]\n\n")),
 	}
+	setClineRetryCountForTest(t, 0)
 
 	srv := httptest.NewServer(requestLogMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleStreamResponse(w, upstream, &requestContext{apiFormat: "openai", startAt: time.Now()}, nil)
+		serveClineChat(w, map[string]any{"model": "m"}, true, true,
+			func(params map[string]any, stream bool, exclude []string) (*http.Response, *Account, *requestContext, error) {
+				return upstream, fakeAccount(1), fakeCtx(fakeAccount(1), 200), nil
+			})
 	})))
 	defer srv.Close()
 
