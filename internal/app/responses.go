@@ -262,7 +262,9 @@ func (s *responsesSSEWriter) event(event string, data any) {
 }
 
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
-func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
+// 返回 nil 表示上游流正常结束；返回非 nil 表示上游中途断流（已发 response.failed），
+// 调用方据此把这次请求记为失败而不是成功。
+func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) error {
 	model := ""
 	// 开场
 	s := newResponsesSSE(w)
@@ -286,6 +288,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	var outText strings.Builder
 
 	reader := bufio.NewReader(upstream.Body)
+	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
@@ -399,8 +402,32 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			}
 		}
 		if err != nil {
+			if err != io.EOF {
+				streamErr = err
+			}
 			break
 		}
+	}
+
+	if streamErr != nil {
+		// 上游中途断流：头已发出，只能发 response.failed，不能发 response.completed
+		// （否则客户端会把被截断的结果当成正常完成）。调用方据返回值记失败。
+		log.Printf("  responses upstream stream aborted: %v", streamErr)
+		s.event("response.failed", map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"id":         s.respID,
+				"object":     "response",
+				"created_at": time.Now().Unix(),
+				"status":     "failed",
+				"model":      model,
+				"error": map[string]any{
+					"code":    "upstream_stream_interrupted",
+					"message": "upstream stream aborted: " + streamErr.Error(),
+				},
+			},
+		})
+		return streamErr
 	}
 
 	// 收尾
@@ -426,6 +453,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
 		},
 	})
+	return nil
 }
 
 // ============ /v1/responses 入口 ============
@@ -485,7 +513,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.WriteHeader(http.StatusOK)
-			chatStreamToResponses(w, resp, nil)
+			// zen 走 zen-stats.jsonl 统计，这里不写 SQLite request_log；
+			// 断流时函数内部已发 response.failed，只补日志。
+			if err := chatStreamToResponses(w, resp, nil); err != nil {
+				log.Printf("  responses zen: upstream stream aborted: %v", err)
+			}
 			return
 		}
 		var raw map[string]any
@@ -520,7 +552,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusOK)
-		chatStreamToResponses(w, up, usageFn)
+		if err := chatStreamToResponses(w, up, usageFn); err != nil {
+			insertRequestRecord(ctx, tokenUsage{}, false, http.StatusBadGateway, "upstream stream aborted: "+err.Error())
+			return
+		}
 		insertRequestRecord(ctx, tokenUsage{}, true, 200, "")
 		return
 	}

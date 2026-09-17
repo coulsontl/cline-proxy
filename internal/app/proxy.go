@@ -1845,6 +1845,8 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	var raw map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		// 记一行失败，否则这种解码失败在管理面板错误列表里查不到
+		insertRequestRecord(ctx, tokenUsage{}, false, 0, "decode upstream: "+err.Error())
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
 		})
@@ -2189,14 +2191,35 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, ctx *
 
 	reader := bufio.NewReader(upstream.Body)
 
+	// 注意区分「正常 EOF」与「上游中途断流」：后者以前被静默 break 掉，
+	// 然后照常发 message_delta/message_stop，客户端会以为请求正常完成、
+	// 统计里也记成功。头已经发出（200 + SSE）改不了状态码，只能按
+	// Anthropic 协议发 error 事件并记为失败。
+	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			processSSELine(line)
 		}
 		if err != nil {
+			if err != io.EOF {
+				streamErr = err
+			}
 			break
 		}
+	}
+
+	if streamErr != nil {
+		log.Printf("  anthropic upstream stream aborted: %v", streamErr)
+		emit("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": "upstream stream aborted: " + streamErr.Error(),
+			},
+		})
+		insertRequestRecord(ctx, u, false, http.StatusBadGateway, "upstream stream aborted: "+streamErr.Error())
+		return
 	}
 
 	// Stop text block if active
